@@ -1,21 +1,4 @@
-//! Differential fuzzing of inference programs: random chains of tensor and module operations run
-//! on the device under test and compared with the Flex reference.
-//!
-//! ```sh
-//! cargo run --release --bin lab-fuzz --features metal,fusion -- --seconds 60
-//! cargo run --release --bin lab-fuzz --features metal,fusion -- --seed 1234 --programs 1
-//! ```
-//!
-//! Each program runs in f32, f16 or bf16, several times on the device under test: lazily,
-//! synchronizing once so fusion sees the whole chain; eagerly, synchronizing after every operation;
-//! on another batch size, when no operation depends on it; and lazily again, once the device has
-//! cached kernels, tuning results and memory for it. A mismatch is reduced to the shortest failing
-//! prefix and written to `--findings` as JSON.
-
-use std::collections::BTreeMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+//! Random programs: their operations, how they are generated and how they run.
 
 use burn::tensor::activation::{gelu, log_softmax, relu, sigmoid, silu, softmax, tanh};
 use burn::tensor::module::{
@@ -24,20 +7,20 @@ use burn::tensor::module::{
 };
 use burn::tensor::ops::{AvgPoolOptions, ConvOptions, MaxPoolOptions};
 use burn::tensor::{DType, Device, FloatDType, Int, Tensor, TensorData, bf16, f16};
-use burn_inference_tests::harness::{ACCELERATED, backend_name, device, exit};
 use serde::Serialize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
-const MAX_ELEMENTS: usize = 1 << 16;
-const MAX_DIM: usize = 96;
+pub(crate) const MAX_ELEMENTS: usize = 1 << 16;
+pub(crate) const MAX_DIM: usize = 96;
 
 /// The float dtypes programs run in, by name.
-const DTYPES: [(&str, FloatDType); 3] = [
+pub(crate) const DTYPES: [(&str, FloatDType); 3] = [
     ("f32", FloatDType::F32),
     ("f16", FloatDType::F16),
     ("bf16", FloatDType::BF16),
 ];
 
-fn dtype_name(dtype: FloatDType) -> &'static str {
+pub(crate) fn dtype_name(dtype: FloatDType) -> &'static str {
     DTYPES
         .iter()
         .find(|(_, candidate)| *candidate == dtype)
@@ -46,7 +29,7 @@ fn dtype_name(dtype: FloatDType) -> &'static str {
 }
 
 /// The nearest value of `dtype` to `value`.
-fn round_to(dtype: FloatDType, value: f32) -> f32 {
+pub(crate) fn round_to(dtype: FloatDType, value: f32) -> f32 {
     match dtype {
         FloatDType::F16 => f16::from_f32(value).to_f32(),
         FloatDType::BF16 => bf16::from_f32(value).to_f32(),
@@ -55,47 +38,47 @@ fn round_to(dtype: FloatDType, value: f32) -> f32 {
 }
 
 /// A xorshift generator: programs must be reproducible from their seed alone.
-struct Rng(u64);
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
     }
 
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
     }
 
-    fn below(&mut self, bound: usize) -> usize {
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
         (self.next() % bound as u64) as usize
     }
 
-    fn range(&mut self, low: usize, high: usize) -> usize {
+    pub(crate) fn range(&mut self, low: usize, high: usize) -> usize {
         low + self.below(high - low + 1)
     }
 
-    fn chance(&mut self, probability: f64) -> bool {
+    pub(crate) fn chance(&mut self, probability: f64) -> bool {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64 <= probability
     }
 
-    fn unit(&mut self) -> f32 {
+    pub(crate) fn unit(&mut self) -> f32 {
         ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
 
-    fn values(&mut self, count: usize, scale: f32) -> Vec<f32> {
+    pub(crate) fn values(&mut self, count: usize, scale: f32) -> Vec<f32> {
         (0..count).map(|_| self.unit() * scale).collect()
     }
 
-    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+    pub(crate) fn pick<T: Copy>(&mut self, items: &[T]) -> T {
         items[self.below(items.len())]
     }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
-enum Unary {
+pub(crate) enum Unary {
     Relu,
     Abs,
     Neg,
@@ -111,7 +94,7 @@ enum Unary {
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
-enum Binary {
+pub(crate) enum Binary {
     Add,
     Sub,
     Mul,
@@ -121,7 +104,7 @@ enum Binary {
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
-enum Reduce {
+pub(crate) enum Reduce {
     Sum,
     Mean,
     Max,
@@ -129,7 +112,7 @@ enum Reduce {
 }
 
 #[derive(Clone, Debug, Serialize)]
-enum Op {
+pub(crate) enum Op {
     Unary(Unary),
     Scalar {
         op: Binary,
@@ -226,7 +209,7 @@ enum Op {
 }
 
 impl Op {
-    fn kind(&self) -> String {
+    pub(crate) fn kind(&self) -> String {
         let debug = format!("{self:?}");
         let end = debug.find([' ', '(', '{']).unwrap_or(debug.len());
         match self {
@@ -238,7 +221,7 @@ impl Op {
     }
 
     /// A description without the constant data, for reports.
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match self {
             Op::Broadcast { op, shape, .. } => {
                 format!("Broadcast {{ op: {op:?}, shape: {shape:?} }}")
@@ -268,7 +251,7 @@ impl Op {
     }
 
     /// Replaces every float constant `v` with `f(v)`.
-    fn map_constants(&mut self, f: impl Fn(f32) -> f32) {
+    pub(crate) fn map_constants(&mut self, f: impl Fn(f32) -> f32) {
         let map = |value: &mut f32| *value = f(*value);
         match self {
             Op::Scalar { value, .. } => map(value),
@@ -284,7 +267,7 @@ impl Op {
     }
 
     /// Whether the operation keeps the batch on axis 0 and holds no constant along it.
-    fn batch_independent(&self) -> bool {
+    pub(crate) fn batch_independent(&self) -> bool {
         match self {
             Op::Broadcast { shape, .. } | Op::Matmul { shape, .. } => shape[0] == 1,
             Op::Permute(axes) => axes[0] == 0,
@@ -295,15 +278,15 @@ impl Op {
     }
 }
 
-fn numel(shape: &[usize; 4]) -> usize {
+pub(crate) fn numel(shape: &[usize; 4]) -> usize {
     shape.iter().product()
 }
 
-fn within_limits(shape: &[usize; 4]) -> bool {
+pub(crate) fn within_limits(shape: &[usize; 4]) -> bool {
     shape.iter().all(|dim| (1..=MAX_DIM * 4).contains(dim)) && numel(shape) <= MAX_ELEMENTS
 }
 
-fn pooled(
+pub(crate) fn pooled(
     size: usize,
     kernel: usize,
     stride: usize,
@@ -326,7 +309,7 @@ fn pooled(
     )
 }
 
-const UNARIES: [Unary; 12] = [
+pub(crate) const UNARIES: [Unary; 12] = [
     Unary::Relu,
     Unary::Abs,
     Unary::Neg,
@@ -340,7 +323,7 @@ const UNARIES: [Unary; 12] = [
     Unary::SqrtAbs,
     Unary::Square,
 ];
-const BINARIES: [Binary; 6] = [
+pub(crate) const BINARIES: [Binary; 6] = [
     Binary::Add,
     Binary::Sub,
     Binary::Mul,
@@ -350,7 +333,11 @@ const BINARIES: [Binary; 6] = [
 ];
 
 /// Draws an operation valid for `shape` in `dtype`, with the shape it produces.
-fn generate_op(rng: &mut Rng, shape: [usize; 4], dtype: FloatDType) -> Option<(Op, [usize; 4])> {
+pub(crate) fn generate_op(
+    rng: &mut Rng,
+    shape: [usize; 4],
+    dtype: FloatDType,
+) -> Option<(Op, [usize; 4])> {
     let [n, c, h, w] = shape;
     // Rounding flips comparisons and argmax, so lower precisions leave them out.
     let exact = dtype == FloatDType::F32;
@@ -531,7 +518,7 @@ fn generate_op(rng: &mut Rng, shape: [usize; 4], dtype: FloatDType) -> Option<(O
     within_limits(&output).then_some((op, output))
 }
 
-fn output_shape(op: &Op, shape: [usize; 4]) -> Option<[usize; 4]> {
+pub(crate) fn output_shape(op: &Op, shape: [usize; 4]) -> Option<[usize; 4]> {
     let [n, c, h, w] = shape;
     Some(match op {
         Op::Conv {
@@ -614,23 +601,23 @@ fn output_shape(op: &Op, shape: [usize; 4]) -> Option<[usize; 4]> {
 }
 
 #[derive(Clone, Debug)]
-struct Input {
-    shape: [usize; 4],
-    data: Vec<f32>,
+pub(crate) struct Input {
+    pub(crate) shape: [usize; 4],
+    pub(crate) data: Vec<f32>,
 }
 
 /// Random operations applied to one input, in one float dtype.
 #[derive(Clone, Debug)]
-struct Program {
-    dtype: FloatDType,
-    input: Input,
-    ops: Vec<Op>,
+pub(crate) struct Program {
+    pub(crate) dtype: FloatDType,
+    pub(crate) input: Input,
+    pub(crate) ops: Vec<Op>,
     /// An input with another batch size, when every operation is independent of it.
-    resized: Option<Input>,
+    pub(crate) resized: Option<Input>,
 }
 
 impl Program {
-    fn generate(seed: u64, max_ops: usize, dtypes: &[FloatDType]) -> Self {
+    pub(crate) fn generate(seed: u64, max_ops: usize, dtypes: &[FloatDType]) -> Self {
         let mut rng = Rng::new(seed);
         // The dtype and the other batch size come from a stream of their own, so f32 programs are
         // those of earlier versions of the fuzzer.
@@ -673,7 +660,7 @@ impl Program {
         program
     }
 
-    fn resize(&self, rng: &mut Rng) -> Option<Input> {
+    pub(crate) fn resize(&self, rng: &mut Rng) -> Option<Input> {
         if !self.ops.iter().all(Op::batch_independent) {
             return None;
         }
@@ -693,19 +680,19 @@ impl Program {
         })
     }
 
-    fn inputs_mut(&mut self) -> impl Iterator<Item = &mut Input> {
+    pub(crate) fn inputs_mut(&mut self) -> impl Iterator<Item = &mut Input> {
         std::iter::once(&mut self.input).chain(self.resized.as_mut())
     }
 
     /// The program reduced to its first `length` operations.
-    fn prefix(&self, length: usize) -> Self {
+    pub(crate) fn prefix(&self, length: usize) -> Self {
         let mut prefix = self.clone();
         prefix.ops.truncate(length);
         prefix
     }
 }
 
-fn float<const D: usize>(
+pub(crate) fn float<const D: usize>(
     data: &[f32],
     shape: [usize; D],
     device: &Device,
@@ -714,7 +701,7 @@ fn float<const D: usize>(
     Tensor::from_data(TensorData::new(data.to_vec(), shape), (device, dtype))
 }
 
-fn unary(op: Unary, x: Tensor<4>) -> Tensor<4> {
+pub(crate) fn unary(op: Unary, x: Tensor<4>) -> Tensor<4> {
     match op {
         Unary::Relu => relu(x),
         Unary::Abs => x.abs(),
@@ -731,7 +718,7 @@ fn unary(op: Unary, x: Tensor<4>) -> Tensor<4> {
     }
 }
 
-fn binary(op: Binary, x: Tensor<4>, y: Tensor<4>) -> Tensor<4> {
+pub(crate) fn binary(op: Binary, x: Tensor<4>, y: Tensor<4>) -> Tensor<4> {
     match op {
         Binary::Add => x + y,
         Binary::Sub => x - y,
@@ -742,7 +729,7 @@ fn binary(op: Binary, x: Tensor<4>, y: Tensor<4>) -> Tensor<4> {
     }
 }
 
-fn apply(op: &Op, x: Tensor<4>, device: &Device) -> Tensor<4> {
+pub(crate) fn apply(op: &Op, x: Tensor<4>, device: &Device) -> Tensor<4> {
     let shape = x.dims();
     let dtype = x.dtype();
     match op {
@@ -868,7 +855,7 @@ fn apply(op: &Op, x: Tensor<4>, device: &Device) -> Tensor<4> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Mode {
+pub(crate) enum Mode {
     /// Synchronizes once, so fusion sees the whole chain.
     Lazy,
     /// Synchronizes after every operation.
@@ -879,7 +866,13 @@ enum Mode {
     Again,
 }
 
-fn execute(input: &Input, ops: &[Op], device: &Device, dtype: FloatDType, mode: Mode) -> Vec<f32> {
+pub(crate) fn execute(
+    input: &Input,
+    ops: &[Op],
+    device: &Device,
+    dtype: FloatDType,
+    mode: Mode,
+) -> Vec<f32> {
     let mut x = float(&input.data, input.shape, device, dtype.into());
     for op in ops {
         x = apply(op, x, device);
@@ -896,7 +889,7 @@ fn execute(input: &Input, ops: &[Op], device: &Device, dtype: FloatDType, mode: 
 }
 
 /// The largest finite magnitude of `values`, at least 1: errors are measured against it.
-fn scale(values: &[f32]) -> f32 {
+pub(crate) fn scale(values: &[f32]) -> f32 {
     values
         .iter()
         .filter(|v| v.is_finite())
@@ -905,10 +898,10 @@ fn scale(values: &[f32]) -> f32 {
 
 /// What a correct device outputs for one input of a program.
 #[derive(Clone)]
-struct Reference {
-    expected: Vec<f32>,
+pub(crate) struct Reference {
+    pub(crate) expected: Vec<f32>,
     /// The error the program's dtype allows on top of the f32 tolerance.
-    slack: f32,
+    pub(crate) slack: f32,
 }
 
 impl Reference {
@@ -916,7 +909,7 @@ impl Reference {
     /// that precision: how far this lands from f32 measures how much the program amplifies
     /// rounding, and so how much error the device may add. Programs that overflow or lose most of
     /// their precision are rejected.
-    fn compute(program: &Program, input: &Input) -> Option<Self> {
+    pub(crate) fn compute(program: &Program, input: &Input) -> Option<Self> {
         let flex = Device::flex();
         let run = |dtype| {
             catch_unwind(AssertUnwindSafe(|| {
@@ -955,7 +948,7 @@ impl Reference {
 
     /// The element of `actual` furthest from its expected value, among those outside the allowed
     /// error.
-    fn violation(&self, actual: &[f32]) -> Option<(usize, f32, f32)> {
+    pub(crate) fn violation(&self, actual: &[f32]) -> Option<(usize, f32, f32)> {
         let scale = scale(&self.expected);
         actual
             .iter()
@@ -972,313 +965,4 @@ impl Reference {
             })
             .max_by(|x, y| (x.1 - x.2).abs().total_cmp(&(y.1 - y.2).abs()))
     }
-}
-
-/// A run of a program on the device under test that disagrees with the reference.
-struct Failure {
-    mode: Mode,
-    input: Input,
-    reference: Reference,
-    /// The device's outputs, unless it panicked.
-    outputs: Option<Vec<f32>>,
-    detail: String,
-    panicked: bool,
-}
-
-enum Outcome {
-    Passed,
-    Invalid,
-    Failed(Box<Failure>),
-}
-
-/// A hash of `message` without its numbers, which vary between runs.
-fn message_hash(message: &str) -> u32 {
-    let first_lines = message.lines().take(12).collect::<String>();
-    first_lines
-        .bytes()
-        .filter(|byte| !byte.is_ascii_digit())
-        .fold(0x811c_9dc5u32, |hash, byte| {
-            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
-        })
-}
-
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
-        .unwrap_or_else(|| "unknown panic".to_string())
-}
-
-fn check(program: &Program, device: &Device) -> Outcome {
-    let Some(reference) = Reference::compute(program, &program.input) else {
-        return Outcome::Invalid;
-    };
-    let resized = program
-        .resized
-        .as_ref()
-        .and_then(|input| Some((input, Reference::compute(program, input)?)));
-
-    let mut runs = vec![
-        (Mode::Lazy, &program.input, &reference),
-        (Mode::Eager, &program.input, &reference),
-    ];
-    runs.extend(
-        resized
-            .as_ref()
-            .map(|(input, reference)| (Mode::Resized, *input, reference)),
-    );
-    runs.push((Mode::Again, &program.input, &reference));
-
-    for (mode, input, reference) in runs {
-        let failure = |outputs, detail, panicked| {
-            Outcome::Failed(Box::new(Failure {
-                mode,
-                input: input.clone(),
-                reference: reference.clone(),
-                outputs,
-                detail,
-                panicked,
-            }))
-        };
-        let outputs = match catch_unwind(AssertUnwindSafe(|| {
-            execute(input, &program.ops, device, program.dtype, mode)
-        })) {
-            Ok(outputs) => outputs,
-            Err(payload) => return failure(None, panic_message(payload.as_ref()), true),
-        };
-        if outputs.len() != reference.expected.len() {
-            let detail = format!(
-                "{} elements, expected {}",
-                outputs.len(),
-                reference.expected.len()
-            );
-            return failure(Some(outputs), detail, true);
-        }
-        if let Some((index, actual, expected)) = reference.violation(&outputs) {
-            let detail = format!("element {index}: {actual} instead of {expected}");
-            return failure(Some(outputs), detail, false);
-        }
-    }
-    Outcome::Passed
-}
-
-struct Options {
-    seed: u64,
-    programs: Option<u64>,
-    duration: Duration,
-    max_ops: usize,
-    dtypes: Vec<FloatDType>,
-    findings: PathBuf,
-}
-
-impl Options {
-    fn parse() -> Self {
-        let mut options = Self {
-            seed: 0,
-            programs: None,
-            duration: Duration::from_secs(60),
-            max_ops: 12,
-            dtypes: DTYPES.map(|(_, dtype)| dtype).to_vec(),
-            findings: PathBuf::from("findings"),
-        };
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            let mut value = || {
-                args.next()
-                    .unwrap_or_else(|| panic!("{arg} expects a value"))
-            };
-            match arg.as_str() {
-                "--seed" => options.seed = value().parse().expect("--seed is an integer"),
-                "--programs" => {
-                    options.programs = Some(value().parse().expect("--programs is a count"))
-                }
-                "--seconds" => {
-                    options.duration =
-                        Duration::from_secs(value().parse().expect("--seconds is a count"))
-                }
-                "--max-ops" => options.max_ops = value().parse().expect("--max-ops is a count"),
-                "--dtypes" => {
-                    options.dtypes = value()
-                        .split(',')
-                        .map(|name| {
-                            DTYPES
-                                .iter()
-                                .find(|(candidate, _)| *candidate == name)
-                                .map(|(_, dtype)| *dtype)
-                                .unwrap_or_else(|| panic!("--dtypes takes f32, f16 and bf16"))
-                        })
-                        .collect()
-                }
-                "--findings" => options.findings = PathBuf::from(value()),
-                _ => panic!("Unknown argument {arg}"),
-            }
-        }
-        options
-    }
-}
-
-fn report(
-    options: &Options,
-    seed: u64,
-    program: &Program,
-    device: &Device,
-    failure: Failure,
-) -> String {
-    // The shortest prefix that still fails is the reproduction.
-    let (program, failure) = (1..=program.ops.len())
-        .find_map(|length| {
-            let prefix = program.prefix(length);
-            match check(&prefix, device) {
-                Outcome::Failed(failure) => Some((prefix, *failure)),
-                Outcome::Passed | Outcome::Invalid => None,
-            }
-        })
-        .unwrap_or_else(|| (program.clone(), failure));
-    let culprit = program.ops.last().expect("Programs have operations");
-    let backend = backend_name();
-    let dtype = dtype_name(program.dtype);
-    let mode = failure.mode;
-    let kind = if failure.panicked {
-        "panic"
-    } else {
-        "mismatch"
-    };
-    // Panics share their cause across operations, so they are told apart by message.
-    let subject = match failure.panicked {
-        true => format!("{:08x}", message_hash(&failure.detail)),
-        false => culprit.kind(),
-    };
-    // Only failures specific to a lower precision name it, so a bug found in every dtype gets one
-    // issue, and f32 findings keep the fingerprints they had before other dtypes were fuzzed.
-    let in_f32 = Program {
-        dtype: FloatDType::F32,
-        ..program.clone()
-    };
-    let precision = match program.dtype == FloatDType::F32
-        || matches!(check(&in_f32, device), Outcome::Failed(_))
-    {
-        true => String::new(),
-        false => format!("-{dtype}"),
-    };
-    let fingerprint = format!("{backend}{precision}-{mode:?}-{kind}-{subject}")
-        .to_lowercase()
-        .replace('+', "-");
-    let features =
-        std::env::var("LAB_FEATURES").unwrap_or_else(|_| "<backend features>".to_string());
-
-    let finding = serde_json::json!({
-        "fingerprint": fingerprint,
-        "backend": backend,
-        "dtype": dtype,
-        "burn_sha": std::env::var("LAB_BURN_SHA").unwrap_or_else(|_| "local".to_string()),
-        "mode": format!("{mode:?}"),
-        "failure": kind,
-        "detail": failure.detail,
-        "seed": seed,
-        "input_shape": failure.input.shape,
-        "culprit": culprit.describe(),
-        "program": program.ops.iter().map(Op::describe).collect::<Vec<_>>(),
-        "reproduce": format!("cargo run --release --bin lab-fuzz --features {features} -- --seed {seed} --programs 1 --max-ops {} --dtypes {dtype}", options.max_ops),
-    });
-    std::fs::create_dir_all(&options.findings).expect("The findings directory should be writable");
-    let judged = serde_json::json!({
-        "dtype": dtype,
-        "slack": failure.reference.slack,
-        "input_shape": failure.input.shape,
-        "input": failure.input.data,
-        "ops": program.ops,
-        "flex": failure.reference.expected,
-        "device": failure.outputs,
-    });
-    std::fs::write(
-        options.findings.join(format!("{fingerprint}.program.json")),
-        serde_json::to_string(&judged).expect("Programs serialize"),
-    )
-    .expect("The program should be writable");
-    let path = options.findings.join(format!("{fingerprint}.json"));
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&finding).expect("Findings serialize"),
-    )
-    .expect("The finding should be writable");
-    println!("FINDING {fingerprint} (seed {seed}, {})", failure.detail);
-    fingerprint
-}
-
-fn main() {
-    let mut options = Options::parse();
-    if !ACCELERATED {
-        eprintln!("Fuzzing compares another backend with Flex: enable a backend feature");
-        exit(2);
-    }
-    let device = device();
-    let probe = catch_unwind(AssertUnwindSafe(|| {
-        Tensor::<1>::ones([4], &device).into_data()
-    }));
-    if let Err(payload) = probe {
-        eprintln!(
-            "The device is unavailable: {}",
-            panic_message(payload.as_ref())
-        );
-        exit(3);
-    }
-    options.dtypes.retain(|&dtype| {
-        let supported = device.supports_dtype(dtype);
-        if !supported {
-            println!(
-                "Skipping {}: the device does not support it",
-                dtype_name(dtype)
-            );
-        }
-        supported
-    });
-    if options.dtypes.is_empty() {
-        eprintln!("The device supports none of the requested dtypes");
-        exit(3);
-    }
-
-    let start = Instant::now();
-    let mut fingerprints = std::collections::BTreeSet::new();
-    // Passed, failed and rejected programs per dtype.
-    let mut counts = BTreeMap::<&str, [u64; 3]>::new();
-    let mut resized = 0u64;
-
-    // Panics are expected while reducing a failure; reports carry the messages.
-    std::panic::set_hook(Box::new(|_| {}));
-    for seed in options.seed.. {
-        let done = match options.programs {
-            Some(programs) => seed - options.seed >= programs,
-            None => start.elapsed() >= options.duration,
-        };
-        if done {
-            break;
-        }
-        let program = Program::generate(seed, options.max_ops, &options.dtypes);
-        let count = counts.entry(dtype_name(program.dtype)).or_default();
-        resized += u64::from(program.resized.is_some());
-        match check(&program, &device) {
-            Outcome::Passed => count[0] += 1,
-            Outcome::Invalid => count[2] += 1,
-            Outcome::Failed(failure) => {
-                count[1] += 1;
-                fingerprints.insert(report(&options, seed, &program, &device, *failure));
-            }
-        }
-    }
-    let _ = std::panic::take_hook();
-
-    let [passed, failed, invalid] = counts.values().fold([0; 3], |total, count| {
-        [0, 1, 2].map(|i| total[i] + count[i])
-    });
-    println!(
-        "{} programs in {:.0?}: {passed} passed, {failed} failed, {invalid} rejected by Flex; {} distinct findings; {resized} also ran on another batch size",
-        passed + failed + invalid,
-        start.elapsed(),
-        fingerprints.len()
-    );
-    for (dtype, [passed, failed, invalid]) in &counts {
-        println!("  {dtype}: {passed} passed, {failed} failed, {invalid} rejected");
-    }
-    exit(i32::from(failed > 0));
 }
