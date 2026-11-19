@@ -35,6 +35,28 @@ Findings are leads, not confirmed bugs, so no workflow opens issues. Open one by
 bug reproduces in a standalone program on upstream `main`, an independent reference such as
 PyTorch shows Burn is wrong, and no existing issue covers it.
 
+`local/triage.py` gathers that evidence on this machine, from local findings or downloaded
+`findings-*` artifacts:
+
+```sh
+uv run local/triage.py <findings directory>... [--bisect]
+```
+
+It keeps worktrees of upstream `origin/main` in `../burn-lab-trees`: one as is, and one with the
+unmerged `fix/*` branches merged, so findings those branches fix are reported as known bugs with the
+branch that fixes them. For the others it measures how often the case fails, shrinks the CubeCL
+environment to the autotune results the failure needs and reduces the case, asks PyTorch which side
+is wrong, builds the standalone reproduction against upstream and runs it, optionally bisects
+upstream commits with it, and searches upstream and the fork for duplicates. Each finding gets a
+`report.md` with the evidence for each condition an issue needs, in `target/lab-triage`. It needs
+`cargo`, `uv` for the oracle and `gh` for the search; it opens nothing.
+
+The worktrees and their builds take tens of gigabytes, so triage deletes them when it ends, with
+the intermediate files, and keeps only each report, its reduced case, the reproduction's sources
+and the autotune results it needs. `--keep-trees` keeps them to save rebuilding next time, and
+`uv run local/triage.py --clean` deletes them later. Fuzzing runs leave their CubeCL environment
+in `<findings>/environment-<seed>`; delete the findings directory once triaged.
+
 Confirmed bugs become tests in `tests/known_bugs.rs`, which CI runs in a step allowed to fail; a
 test that starts passing marks the fix. `LAB_SKIP` skips tests by name fragment for known
 limitations of a runner.
