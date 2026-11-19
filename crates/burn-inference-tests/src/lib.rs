@@ -1,5 +1,8 @@
 //! Models and fixtures shared by the end-to-end inference tests.
 
+pub mod harness;
+pub mod zoo;
+
 use burn::{
     module::Module,
     nn::{

@@ -2,38 +2,13 @@
 
 #![allow(clippy::single_range_in_vec_init)]
 
-use std::io::Write;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
 
 use burn::nn::attention::generate_autoregressive_mask;
 use burn::nn::transformer::{TransformerDecoderConfig, TransformerDecoderInput};
 use burn::tensor::{Bool, Device, Distribution, Int, Tensor, TensorData, Tolerance};
+use burn_inference_tests::harness::{ACCELERATED, TestCase, device, run};
 use burn_inference_tests::{Array, Reference, TinyResNet, TinyTransformer};
-
-const ACCELERATED: bool = cfg!(any(
-    feature = "cpu",
-    feature = "cuda",
-    feature = "metal",
-    feature = "wgpu"
-));
-
-/// The device under test.
-fn device() -> Device {
-    #[cfg(feature = "metal")]
-    return Device::metal();
-    #[cfg(all(feature = "cuda", not(feature = "metal")))]
-    return Device::cuda(0);
-    #[cfg(all(feature = "wgpu", not(any(feature = "metal", feature = "cuda"))))]
-    return Device::wgpu(Default::default());
-    #[cfg(all(
-        feature = "cpu",
-        not(any(feature = "metal", feature = "cuda", feature = "wgpu"))
-    ))]
-    return Device::cpu();
-    #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "metal", feature = "wgpu")))]
-    Device::flex()
-}
 
 fn float_tensor<const D: usize>(array: &Array<f32>, device: &Device) -> Tensor<D> {
     Tensor::from_data(
@@ -271,27 +246,8 @@ fn cached_decoding_matches_full_decoding() {
     }
 }
 
-/// Ends the process with `code` once the device has finished its work.
-fn exit(code: i32) -> ! {
-    device().sync().expect("The device should finish its work");
-    std::io::stdout().flush().expect("Stdout should flush");
-
-    // CubeCL's exit handler reads a thread-local that macOS has already destroyed and aborts.
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn _exit(code: core::ffi::c_int) -> !;
-        }
-        // SAFETY: `_exit` takes a status and never returns; the output was flushed above.
-        unsafe { _exit(code) }
-    }
-    #[cfg(not(target_os = "macos"))]
-    std::process::exit(code)
-}
-
 fn main() {
-    let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
-    let mut tests: Vec<(&str, fn())> = vec![
+    let mut tests: Vec<TestCase> = vec![
         ("resnet_matches_pytorch", resnet_matches_pytorch),
         ("transformer_matches_pytorch", transformer_matches_pytorch),
         (
@@ -322,22 +278,5 @@ fn main() {
             accelerated_device_matches_flex,
         ));
     }
-    tests.retain(|(name, _)| filter.as_deref().is_none_or(|filter| name.contains(filter)));
-
-    let mut failed = Vec::new();
-    for (name, test) in &tests {
-        let passed = catch_unwind(AssertUnwindSafe(test)).is_ok();
-        println!("test {name} ... {}", if passed { "ok" } else { "FAILED" });
-        if !passed {
-            failed.push(*name);
-        }
-    }
-
-    println!(
-        "\ntest result: {}. {} passed; {} failed",
-        if failed.is_empty() { "ok" } else { "FAILED" },
-        tests.len() - failed.len(),
-        failed.len()
-    );
-    exit(i32::from(!failed.is_empty()));
+    run(tests);
 }

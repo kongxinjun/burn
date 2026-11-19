@@ -1,0 +1,69 @@
+name: Lab setup
+description: >-
+  Checks out upstream Burn with the lab's inference suite copied in, installs Rust, and restores the
+  exported models.
+
+inputs:
+  burn-ref:
+    description: Upstream branch, tag or commit to test.
+    default: main
+  path:
+    description: Where to check out upstream Burn.
+    default: upstream
+  cache-key:
+    description: Distinguishes the Rust build caches of different feature sets.
+    required: true
+  models:
+    description: Whether to restore the exported models into `lab-models`.
+    default: "false"
+
+outputs:
+  burn-sha:
+    description: The upstream commit under test.
+    value: ${{ steps.overlay.outputs.sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out upstream Burn
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: tracel-ai/burn
+        ref: ${{ inputs.burn-ref }}
+        path: ${{ inputs.path }}
+        persist-credentials: false
+
+    - name: Copy the lab suite into upstream Burn
+      id: overlay
+      shell: bash
+      env:
+        UPSTREAM: ${{ inputs.path }}
+      run: |
+        rm -rf "$UPSTREAM/crates/burn-inference-tests"
+        cp -R crates/burn-inference-tests "$UPSTREAM/crates/"
+        sha=$(git -C "$UPSTREAM" rev-parse HEAD)
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "LAB_BURN_SHA=$sha" >> "$GITHUB_ENV"
+        echo "Testing tracel-ai/burn@$sha" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Install Rust
+      shell: bash
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup default stable
+
+    - name: Cache Rust builds
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        workspaces: ${{ inputs.path }} -> target
+        key: ${{ inputs.cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/lab' }}
+
+    - name: Restore the exported models
+      if: inputs.models == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: lab-models
+        key: lab-models-${{ hashFiles('crates/burn-inference-tests/zoo/generate.py') }}
+        enableCrossOsArchive: true
+        fail-on-cache-miss: true

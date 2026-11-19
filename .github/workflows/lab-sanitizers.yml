@@ -1,0 +1,65 @@
+name: lab-sanitizers
+
+on:
+  schedule:
+    - cron: "7 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      burn-ref:
+        description: Upstream branch, tag or commit to test
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BURN_LAB_MODELS: ${{ github.workspace }}/lab-models
+
+jobs:
+  models:
+    uses: ./.github/workflows/lab-models.yml
+
+  sanitize:
+    name: ${{ matrix.sanitizer }}
+    needs: models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Memory errors and leaks in the Flex CPU backend and the model code above it.
+          - sanitizer: address
+            build-std: ""
+            filter: ""
+          # Data races between threads sharing a model; the standard library is rebuilt with
+          # instrumentation, as TSan requires.
+          - sanitizer: thread
+            build-std: "-Zbuild-std"
+            filter: concurrent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/lab-setup
+        with:
+          burn-ref: ${{ inputs.burn-ref || 'main' }}
+          cache-key: sanitizer-${{ matrix.sanitizer }}
+          models: "true"
+
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: Test under the sanitizer
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }} -Cdebuginfo=1
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          BUILD_STD: ${{ matrix.build-std }}
+          FILTER: ${{ matrix.filter }}
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          for test in inference zoo; do
+            cargo +nightly test $BUILD_STD --release --target x86_64-unknown-linux-gnu --test "$test" -- $FILTER
+          done

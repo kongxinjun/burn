@@ -1,0 +1,231 @@
+name: lab-performance
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+    inputs:
+      burn-ref:
+        description: Upstream branch, tag or commit to measure
+        default: main
+      base-ref:
+        description: Upstream commit to compare with (default, the last commit from a day earlier)
+        default: ""
+
+concurrency:
+  group: lab-performance
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BURN_LAB_MODELS: ${{ github.workspace }}/lab-models
+
+jobs:
+  models:
+    uses: ./.github/workflows/lab-models.yml
+
+  latency:
+    name: latency (${{ matrix.name }})
+    needs: models
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: flex, os: ubuntu-24.04, features: "" }
+          - { name: cpu+fusion, os: ubuntu-24.04, features: "cpu,fusion" }
+          - { name: metal+fusion, os: macos-15, features: "metal,fusion" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/lab-setup
+        with:
+          burn-ref: ${{ inputs.burn-ref || 'main' }}
+          cache-key: ${{ matrix.name }}
+          models: "true"
+
+      - name: Measure
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          cargo build --release --bin lab-bench --features "$FEATURES"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ../../target/release/lab-bench --iterations 20 --json "$GITHUB_WORKSPACE/latency.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: latency-${{ strategy.job-index }}
+          path: latency.json
+
+  instructions:
+    # Wall time on shared runners varies by 10% or more; instruction counts barely move, so they
+    # expose smaller regressions on the CPU backend.
+    needs: models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - uses: ./.github/actions/lab-setup
+        with:
+          burn-ref: ${{ inputs.burn-ref || 'main' }}
+          cache-key: flex
+          models: "true"
+
+      - name: Count instructions
+        working-directory: upstream
+        run: |
+          cargo build --release --bin lab-bench --manifest-path crates/burn-inference-tests/Cargo.toml
+          python3 "$GITHUB_WORKSPACE/crates/burn-inference-tests/ci/callgrind.py" \
+            --bench target/release/lab-bench --json "$GITHUB_WORKSPACE/instructions.json" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: instructions
+          path: instructions.json
+
+  compare:
+    # Runs yesterday's and today's Burn alternately on one machine: the noise of shared runners
+    # cancels out, unlike comparisons between measurements taken on different nights.
+    name: compare (${{ matrix.name }})
+    needs: models
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: flex, os: ubuntu-24.04, features: "" }
+          - { name: metal+fusion, os: macos-15, features: "metal,fusion" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/lab-setup
+        id: setup
+        with:
+          burn-ref: ${{ inputs.burn-ref || 'main' }}
+          cache-key: ${{ matrix.name }}
+          models: "true"
+
+      - name: Choose the base commit
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ inputs.base-ref }}
+          HEAD_SHA: ${{ steps.setup.outputs.burn-sha }}
+        run: |
+          if [ -z "$BASE_REF" ]; then
+            until=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)
+            BASE_REF=$(gh api "repos/tracel-ai/burn/commits?sha=main&until=$until&per_page=1" --jq '.[0].sha')
+          fi
+          echo "sha=$BASE_REF" >> "$GITHUB_OUTPUT"
+          if [ "$BASE_REF" = "$HEAD_SHA" ]; then echo "same=true" >> "$GITHUB_OUTPUT"; fi
+          echo "Comparing tracel-ai/burn@$BASE_REF with @$HEAD_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out the base commit
+        if: steps.base.outputs.same != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tracel-ai/burn
+          ref: ${{ steps.base.outputs.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: Build both commits
+        if: steps.base.outputs.same != 'true'
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          rm -rf base/crates/burn-inference-tests
+          cp -R crates/burn-inference-tests base/crates/
+          for tree in upstream base; do
+            cargo build --release --bin lab-bench --features "$FEATURES" \
+              --manifest-path "$tree/crates/burn-inference-tests/Cargo.toml"
+          done
+
+      - name: Compare
+        id: compare
+        if: steps.base.outputs.same != 'true'
+        run: |
+          python3 crates/burn-inference-tests/ci/ab_compare.py \
+            --base base/target/release/lab-bench --head upstream/target/release/lab-bench \
+            --report report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: File an issue for regressions
+        if: steps.compare.outputs.regressed == 'true' && github.ref == 'refs/heads/lab'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NAME: ${{ matrix.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create lab-perf --color FBCA04 --description "Found by lab-performance" --force
+          { cat report.md; echo; echo "Run: $RUN_URL"; } > body.md
+          gh issue create --label lab-perf --title "lab-perf: $NAME slower on $(date -u +%F)" --body-file body.md
+
+  publish:
+    # Keeps the history charts on GitHub Pages: https://<owner>.github.io/<repo>/dev/bench/
+    needs: [latency, instructions]
+    if: github.ref == 'refs/heads/lab' && !cancelled()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: results
+          merge-multiple: false
+
+      - name: Merge the latency results
+        run: jq -s add results/latency-*/latency.json > latency.json
+
+      - name: Latency history
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: Inference latency
+          tool: customSmallerIsBetter
+          output-file-path: latency.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ github.token }}
+          auto-push: true
+          alert-threshold: "130%"
+          comment-on-alert: true
+          summary-always: true
+          max-items-in-chart: 120
+
+      - name: Instruction count history
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: Flex instruction counts
+          tool: customSmallerIsBetter
+          output-file-path: results/instructions/instructions.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ github.token }}
+          auto-push: true
+          alert-threshold: "103%"
+          comment-on-alert: true
+          summary-always: true
+          max-items-in-chart: 120

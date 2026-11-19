@@ -19,11 +19,18 @@ metal = ["burn/metal"]
 wgpu = ["burn/wgpu"]
 
 [dependencies]
-burn = { workspace = true, features = ["default", "flex"] }
-burn-store = { workspace = true, features = ["default", "std", "safetensors"] }
+# Not `default`: it enables fusion on every CubeCL backend, which the `fusion` feature controls here.
+burn = { workspace = true, features = ["autotune", "flex", "rayon", "simd", "std"] }
+burn-store = { workspace = true, features = ["std", "safetensors"] }
+libc = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+safetensors = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
 
 [[test]]
 harness = false
 name = "inference"
+
+[[test]]
+harness = false
+name = "zoo"

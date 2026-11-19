@@ -1,0 +1,45 @@
+name: lab-models
+
+# Exports the pretrained models once per version of the export script, for the other lab workflows.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Look for exported models
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: lab-models
+          key: lab-models-${{ hashFiles('crates/burn-inference-tests/zoo/generate.py') }}
+          enableCrossOsArchive: true
+          lookup-only: true
+
+      - name: Install uv
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Export the models with PyTorch
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          # CPU wheels: the CUDA build of PyTorch is several gigabytes.
+          UV_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+        run: uv run crates/burn-inference-tests/zoo/generate.py lab-models
+
+      - name: Save the models
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: lab-models
+          key: lab-models-${{ hashFiles('crates/burn-inference-tests/zoo/generate.py') }}
+          enableCrossOsArchive: true

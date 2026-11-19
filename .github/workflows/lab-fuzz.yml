@@ -1,0 +1,104 @@
+name: lab-fuzz
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      burn-ref:
+        description: Upstream branch, tag or commit to test
+        default: main
+      seconds:
+        description: Fuzzing time per shard
+        default: "1500"
+
+concurrency:
+  group: lab-fuzz
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DISABLE_WGPU_SPIRV: "1"
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target.name }}, shard ${{ matrix.shard }})
+    runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+        target:
+          - { name: wgpu+fusion lavapipe, os: ubuntu-24.04, features: "wgpu,fusion", lavapipe: true }
+          - { name: wgpu lavapipe, os: ubuntu-24.04, features: "wgpu", lavapipe: true }
+          - { name: cpu+fusion, os: ubuntu-24.04, features: "cpu,fusion" }
+          - { name: metal+fusion, os: macos-15, features: "metal,fusion" }
+          - { name: metal, os: macos-15, features: "metal" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the lavapipe software Vulkan driver
+        if: matrix.target.lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+
+      - uses: ./.github/actions/lab-setup
+        with:
+          burn-ref: ${{ inputs.burn-ref || 'main' }}
+          cache-key: ${{ matrix.target.name }}
+
+      - name: Build the fuzzer
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.target.features }}
+        run: cargo build --release --bin lab-fuzz --features "$FEATURES"
+
+      - name: Fuzz
+        working-directory: upstream
+        env:
+          LAB_FEATURES: ${{ matrix.target.features }}
+          SECONDS_PER_SHARD: ${{ inputs.seconds || '1500' }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          # Every run and shard draws disjoint seeds, so any finding is reproducible from its seed.
+          seed=$(( (GITHUB_RUN_NUMBER * 8 + SHARD) * 1000000 ))
+          ./target/release/lab-fuzz --seed "$seed" --seconds "$SECONDS_PER_SHARD" --findings "$GITHUB_WORKSPACE/findings" \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload findings
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: findings-${{ strategy.job-index }}
+          path: findings
+          if-no-files-found: ignore
+
+  report:
+    needs: fuzz
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: findings-*
+          path: findings
+
+      - name: File or update an issue per finding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: crates/burn-inference-tests/ci/report-findings.sh findings

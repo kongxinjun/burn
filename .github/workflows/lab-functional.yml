@@ -1,0 +1,86 @@
+name: lab-functional
+
+on:
+  push:
+    branches: [lab]
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      burn-ref:
+        description: Upstream branch, tag or commit to test
+        default: main
+
+concurrency:
+  group: lab-functional-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BURN_LAB_MODELS: ${{ github.workspace }}/lab-models
+  DISABLE_WGPU_SPIRV: "1"
+
+jobs:
+  models:
+    uses: ./.github/workflows/lab-models.yml
+
+  test:
+    name: test (${{ matrix.name }})
+    needs: models
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: flex, os: ubuntu-24.04, features: "" }
+          - { name: cpu+fusion, os: ubuntu-24.04, features: "cpu,fusion" }
+          - { name: wgpu+fusion lavapipe, os: ubuntu-24.04, features: "wgpu,fusion", lavapipe: true }
+          - { name: wgpu lavapipe, os: ubuntu-24.04, features: "wgpu", lavapipe: true }
+          - { name: metal+fusion, os: macos-15, features: "metal,fusion" }
+          - { name: metal, os: macos-15, features: "metal" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the lavapipe software Vulkan driver
+        if: matrix.lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          vulkaninfo --summary
+
+      - uses: ./.github/actions/lab-setup
+        with:
+          burn-ref: ${{ inputs.burn-ref || 'main' }}
+          cache-key: ${{ matrix.name }}
+          models: "true"
+
+      - name: Small models
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --release --test inference --features "$FEATURES"
+
+      - name: Pretrained models
+        if: success() || failure()
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --release --test zoo --features "$FEATURES"
+
+      # Tracks a known upstream bug: CubeCL's exit handler aborts Metal programs on macOS. This
+      # step starts passing once it is fixed.
+      - name: "Known issue: Metal programs abort at exit"
+        if: matrix.name == 'metal+fusion'
+        continue-on-error: true
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          LAB_NORMAL_EXIT: "1"
+        run: |
+          cargo build --release --bin lab-bench --features metal,fusion
+          ../../target/release/lab-bench --scenario mobilenet_v2/b1 --warmup 0 --iterations 1

@@ -10,3 +10,10 @@ test-cpu-no-fusion = "test --release --test inference --features cpu"
 test-cuda-no-fusion = "test --release --test inference --features cuda"
 test-metal-no-fusion = "test --release --test inference --features metal"
 test-wgpu-no-fusion = "test --release --test inference --features wgpu"
+
+# Pretrained models, exported by zoo/generate.py
+zoo-flex = "test --release --test zoo"
+zoo-cpu = "test --release --test zoo --features cpu,fusion"
+zoo-metal = "test --release --test zoo --features metal,fusion"
+zoo-metal-no-fusion = "test --release --test zoo --features metal"
+zoo-wgpu = "test --release --test zoo --features wgpu,fusion"
