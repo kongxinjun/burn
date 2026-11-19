@@ -22,6 +22,7 @@ use burn::tensor::module::{
 use burn::tensor::ops::{AvgPoolOptions, ConvOptions, MaxPoolOptions};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use burn_inference_tests::harness::{ACCELERATED, backend_name, device, exit};
+use serde::Serialize;
 
 const MAX_ELEMENTS: usize = 1 << 16;
 const MAX_DIM: usize = 96;
@@ -66,7 +67,7 @@ impl Rng {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 enum Unary {
     Relu,
     Abs,
@@ -82,7 +83,7 @@ enum Unary {
     Square,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 enum Binary {
     Add,
     Sub,
@@ -92,7 +93,7 @@ enum Binary {
     SafeDiv,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 enum Reduce {
     Sum,
     Mean,
@@ -100,7 +101,7 @@ enum Reduce {
     Min,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 enum Op {
     Unary(Unary),
     Scalar {
@@ -790,6 +791,17 @@ enum Outcome {
     },
 }
 
+/// A hash of `message` without its numbers, which vary between runs.
+fn message_hash(message: &str) -> u32 {
+    let first_lines = message.lines().take(12).collect::<String>();
+    first_lines
+        .bytes()
+        .filter(|byte| !byte.is_ascii_digit())
+        .fold(0x811c_9dc5u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        })
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<String>()
@@ -906,7 +918,7 @@ fn report(
             *mode,
             format!("element {index}: {actual} instead of {expected}"),
         ),
-        Outcome::Panic { mode, message } => (*mode, format!("panic: {message}")),
+        Outcome::Panic { mode, message } => (*mode, message.clone()),
         _ => unreachable!("Only failures are reported"),
     };
     let failure = if matches!(outcome, Outcome::Panic { .. }) {
@@ -914,7 +926,12 @@ fn report(
     } else {
         "mismatch"
     };
-    let fingerprint = format!("{backend}-{mode:?}-{failure}-{}", culprit.kind())
+    // Panics share their cause across operations, so they are told apart by message.
+    let subject = match outcome {
+        Outcome::Panic { message, .. } => format!("{:08x}", message_hash(message)),
+        _ => culprit.kind(),
+    };
+    let fingerprint = format!("{backend}-{mode:?}-{failure}-{subject}")
         .to_lowercase()
         .replace('+', "-");
     let features =
@@ -934,6 +951,24 @@ fn report(
         "reproduce": format!("cargo run --release --bin lab-fuzz --features {features} -- --seed {seed} --programs 1 --max-ops {}", options.max_ops),
     });
     std::fs::create_dir_all(&options.findings).expect("The findings directory should be writable");
+    let outputs = |device: &Device, mode| {
+        catch_unwind(AssertUnwindSafe(|| {
+            execute(shape, input, &ops[..length], device, mode)
+        }))
+        .ok()
+    };
+    let program = serde_json::json!({
+        "input_shape": shape,
+        "input": input,
+        "ops": &ops[..length],
+        "flex": outputs(&Device::flex(), Mode::Lazy),
+        "device": outputs(device, mode),
+    });
+    std::fs::write(
+        options.findings.join(format!("{fingerprint}.program.json")),
+        serde_json::to_string(&program).expect("Programs serialize"),
+    )
+    .expect("The program should be writable");
     let path = options.findings.join(format!("{fingerprint}.json"));
     std::fs::write(
         &path,
@@ -951,6 +986,16 @@ fn main() {
         exit(2);
     }
     let device = device();
+    let probe = catch_unwind(AssertUnwindSafe(|| {
+        Tensor::<1>::ones([4], &device).into_data()
+    }));
+    if let Err(payload) = probe {
+        eprintln!(
+            "The device is unavailable: {}",
+            panic_message(payload.as_ref())
+        );
+        exit(3);
+    }
     let start = Instant::now();
     let mut fingerprints = std::collections::BTreeSet::new();
     let [mut passed, mut invalid, mut failed] = [0u64; 3];

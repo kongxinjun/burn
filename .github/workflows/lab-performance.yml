@@ -37,8 +37,8 @@ jobs:
       matrix:
         include:
           - { name: flex, os: ubuntu-24.04, features: "" }
+          - { name: flex macos, os: macos-15, features: "" }
           - { name: cpu+fusion, os: ubuntu-24.04, features: "cpu,fusion" }
-          - { name: metal+fusion, os: macos-15, features: "metal,fusion" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -112,7 +112,7 @@ jobs:
       matrix:
         include:
           - { name: flex, os: ubuntu-24.04, features: "" }
-          - { name: metal+fusion, os: macos-15, features: "metal,fusion" }
+          - { name: cpu+fusion, os: ubuntu-24.04, features: "cpu,fusion" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

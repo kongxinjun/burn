@@ -53,9 +53,23 @@ pub fn backend_name() -> String {
 pub type TestCase = (&'static str, fn());
 
 /// Runs the tests selected by the first command line filter and exits with their status.
+///
+/// `LAB_SKIP` holds comma-separated name fragments of tests to skip, for known limitations of an
+/// environment.
 pub fn run(mut tests: Vec<TestCase>) -> ! {
     let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
-    tests.retain(|(name, _)| filter.as_deref().is_none_or(|filter| name.contains(filter)));
+    let skip = std::env::var("LAB_SKIP").unwrap_or_default();
+    let skip = skip
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    tests.retain(|(name, _)| {
+        let skipped = skip.iter().any(|part| name.contains(part));
+        if skipped {
+            println!("test {name} ... skipped");
+        }
+        !skipped && filter.as_deref().is_none_or(|filter| name.contains(filter))
+    });
 
     let mut failed = Vec::new();
     for (name, test) in &tests {

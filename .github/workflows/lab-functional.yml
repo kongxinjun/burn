@@ -37,11 +37,14 @@ jobs:
       matrix:
         include:
           - { name: flex, os: ubuntu-24.04, features: "" }
+          # Hosted macOS runners have a paravirtual GPU without Metal 3, which CubeCL requires:
+          # macOS covers Flex on Apple CPUs here, and Metal runs in lab-metal on your own Mac.
+          - { name: flex macos, os: macos-15, features: "" }
           - { name: cpu+fusion, os: ubuntu-24.04, features: "cpu,fusion" }
-          - { name: wgpu+fusion lavapipe, os: ubuntu-24.04, features: "wgpu,fusion", lavapipe: true }
-          - { name: wgpu lavapipe, os: ubuntu-24.04, features: "wgpu", lavapipe: true }
-          - { name: metal+fusion, os: macos-15, features: "metal,fusion" }
-          - { name: metal, os: macos-15, features: "metal" }
+          - { name: cpu, os: ubuntu-24.04, features: "cpu" }
+          # lavapipe caps storage buffers at 128 MiB, below distilgpt2's 147 MiB output layer.
+          - { name: wgpu+fusion lavapipe, os: ubuntu-24.04, features: "wgpu,fusion", lavapipe: true, skip: distilgpt2 }
+          - { name: wgpu lavapipe, os: ubuntu-24.04, features: "wgpu", lavapipe: true, skip: distilgpt2 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,16 +74,23 @@ jobs:
         working-directory: upstream/crates/burn-inference-tests
         env:
           FEATURES: ${{ matrix.features }}
+          LAB_SKIP: ${{ matrix.skip }}
         run: cargo test --release --test zoo --features "$FEATURES"
 
-      # Tracks a known upstream bug: CubeCL's exit handler aborts Metal programs on macOS. This
-      # step starts passing once it is fixed.
-      - name: "Known issue: Metal programs abort at exit"
-        if: matrix.name == 'metal+fusion'
+      # Steps allowed to fail: each tracks a confirmed problem and starts passing once it is fixed.
+      - name: "Known limitation: tests skipped on this runner"
+        if: matrix.skip
         continue-on-error: true
         working-directory: upstream/crates/burn-inference-tests
         env:
-          LAB_NORMAL_EXIT: "1"
-        run: |
-          cargo build --release --bin lab-bench --features metal,fusion
-          ../../target/release/lab-bench --scenario mobilenet_v2/b1 --warmup 0 --iterations 1
+          FEATURES: ${{ matrix.features }}
+          SKIPPED: ${{ matrix.skip }}
+        run: cargo test --release --test zoo --features "$FEATURES" -- "$SKIPPED"
+
+      - name: "Known upstream bugs"
+        if: matrix.features != ''
+        continue-on-error: true
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --release --test known_bugs --features "$FEATURES"

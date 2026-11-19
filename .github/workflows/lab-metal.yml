@@ -1,0 +1,106 @@
+name: lab-metal
+
+# Metal needs a real Apple GPU, which hosted runners lack. This workflow runs on a self-hosted runner
+# labelled `metal`, such as your own Mac; see the lab README. It only starts by hand, so nothing
+# waits in the queue while that machine is offline.
+on:
+  workflow_dispatch:
+    inputs:
+      burn-ref:
+        description: Upstream branch, tag or commit to test
+        default: main
+      fuzz-seconds:
+        description: Fuzzing time per configuration
+        default: "600"
+
+concurrency:
+  group: lab-metal
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BURN_LAB_MODELS: ${{ github.workspace }}/lab-models
+
+jobs:
+  models:
+    uses: ./.github/workflows/lab-models.yml
+
+  metal:
+    name: metal (${{ matrix.name }})
+    needs: models
+    runs-on: [self-hosted, macOS, ARM64, metal]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - { name: fusion, features: "metal,fusion" }
+          - { name: no fusion, features: "metal" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/lab-setup
+        with:
+          burn-ref: ${{ inputs.burn-ref }}
+          cache-key: metal-${{ matrix.name }}
+          models: "true"
+
+      - name: Small models
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --release --test inference --features "$FEATURES"
+
+      - name: Pretrained models
+        if: success() || failure()
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --release --test zoo --features "$FEATURES"
+
+      - name: Latency
+        if: success() || failure()
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          cargo build --release --bin lab-bench --bin lab-fuzz --features "$FEATURES"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ../../target/release/lab-bench --iterations 20 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fuzz
+        if: success() || failure()
+        working-directory: upstream
+        env:
+          LAB_FEATURES: ${{ matrix.features }}
+          SECONDS_TO_FUZZ: ${{ inputs.fuzz-seconds }}
+        run: |
+          ./target/release/lab-fuzz --seed $(( GITHUB_RUN_NUMBER * 1000000 + 500000000 )) \
+            --seconds "$SECONDS_TO_FUZZ" --findings "$GITHUB_WORKSPACE/findings" | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: findings-metal-${{ strategy.job-index }}
+          path: findings
+          if-no-files-found: ignore
+
+      - name: "Known upstream bugs"
+        continue-on-error: true
+        working-directory: upstream/crates/burn-inference-tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --release --test known_bugs --features "$FEATURES"
+
+      - name: "Known issue: Metal programs abort at exit"
+        continue-on-error: true
+        working-directory: upstream
+        env:
+          LAB_NORMAL_EXIT: "1"
+        run: ./target/release/lab-bench --scenario mobilenet_v2/b1 --warmup 0 --iterations 1

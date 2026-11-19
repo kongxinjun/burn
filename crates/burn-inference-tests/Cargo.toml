@@ -34,3 +34,7 @@ name = "inference"
 [[test]]
 harness = false
 name = "zoo"
+
+[[test]]
+harness = false
+name = "known_bugs"

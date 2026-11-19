@@ -8,14 +8,31 @@ the fork and runs on GitHub Actions against the latest upstream `main`: every jo
 
 | Workflow | When | What it does |
 | --- | --- | --- |
-| `lab-functional` | Every push to `lab`, daily | Small and pretrained models on Flex, CubeCL CPU, wgpu (lavapipe) and Metal, with and without fusion |
-| `lab-fuzz` | Every 6 hours | Random inference programs on each backend against Flex; files one issue per distinct failure |
+| `lab-functional` | Every push to `lab`, daily | Small and pretrained models on Flex (Linux and macOS), CubeCL CPU and wgpu (lavapipe), with and without fusion, plus the known-bug tests |
+| `lab-fuzz` | Every 6 hours | Random inference programs on CubeCL CPU and wgpu against Flex; PyTorch judges each failure, and each distinct one gets an issue |
 | `lab-performance` | Daily | Latency and memory history on GitHub Pages, Callgrind instruction counts, and a same-machine comparison with the previous day's Burn that files an issue on regression |
 | `lab-sanitizers` | Weekly | AddressSanitizer on the suites, ThreadSanitizer on the concurrency tests |
+| `lab-metal` | By hand | Everything above on Metal, on a self-hosted runner labelled `metal` |
 
 All of them can be started by hand from the Actions tab, with an upstream branch, tag or commit.
-Hosted runners have no NVIDIA or AMD GPU: wgpu runs on lavapipe, Mesa's software Vulkan driver, and
-Metal on the macOS runners' virtual GPU. CUDA and ROCm are not covered.
+Hosted runners have no usable GPU: wgpu runs on lavapipe, Mesa's software Vulkan driver, and the
+macOS runners' paravirtual GPU lacks the Metal 3 that CubeCL requires. CUDA and ROCm are not
+covered.
+
+To run `lab-metal` on your Mac, add a runner under Settings → Actions → Runners → New self-hosted
+runner, give it the extra label `metal`, and start it only while you dispatch the workflow. The
+workflows never run on pull requests, so code from other people's forks does not reach it.
+
+## Triage
+
+`lab-fuzz` writes every failure with its whole program, and `ci/oracle.py` recomputes it with
+PyTorch. The verdict labels the issue: `device-wrong`, `flex-wrong` (Flex, the reference, is the
+buggy one), `both-wrong` or `pytorch-rejected`. A run opens at most five new issues, groups panics
+by message, and stops when most programs fail, which points to the environment.
+
+Confirmed bugs become tests in `tests/known_bugs.rs`, which CI runs in a step allowed to fail; a
+test that starts passing marks the fix. `LAB_SKIP` skips tests by name fragment for known
+limitations of a runner.
 
 ## Models
 

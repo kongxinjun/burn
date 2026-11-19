@@ -36,8 +36,7 @@ jobs:
           - { name: wgpu+fusion lavapipe, os: ubuntu-24.04, features: "wgpu,fusion", lavapipe: true }
           - { name: wgpu lavapipe, os: ubuntu-24.04, features: "wgpu", lavapipe: true }
           - { name: cpu+fusion, os: ubuntu-24.04, features: "cpu,fusion" }
-          - { name: metal+fusion, os: macos-15, features: "metal,fusion" }
-          - { name: metal, os: macos-15, features: "metal" }
+          - { name: cpu, os: ubuntu-24.04, features: "cpu" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,8 +68,14 @@ jobs:
         run: |
           # Every run and shard draws disjoint seeds, so any finding is reproducible from its seed.
           seed=$(( (GITHUB_RUN_NUMBER * 8 + SHARD) * 1000000 ))
+          # Exit codes: 1 findings, 3 device unavailable, 4 too many failures to be bugs.
+          status=0
           ./target/release/lab-fuzz --seed "$seed" --seconds "$SECONDS_PER_SHARD" --findings "$GITHUB_WORKSPACE/findings" \
-            | tee -a "$GITHUB_STEP_SUMMARY" || true
+            | tee -a "$GITHUB_STEP_SUMMARY" || status=${PIPESTATUS[0]}
+          if [ "$status" -gt 1 ]; then
+            echo "::error::The fuzzer stopped with status $status: the environment, not the programs, is failing"
+            exit "$status"
+          fi
 
       - name: Upload findings
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -95,6 +100,19 @@ jobs:
         with:
           pattern: findings-*
           path: findings
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Judge every finding with PyTorch
+        env:
+          UV_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+        run: |
+          shopt -s nullglob globstar
+          programs=(findings/**/*.program.json)
+          if [ ${#programs[@]} -gt 0 ]; then
+            uv run crates/burn-inference-tests/ci/oracle.py "${programs[@]}" | tee verdicts.jsonl
+          fi
 
       - name: File or update an issue per finding
         env:
