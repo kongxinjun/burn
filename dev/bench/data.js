@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795068447393,
+  "lastUpdate": 1795068449754,
   "repoUrl": "https://github.com/kongxinjun/burn",
   "entries": {
     "Inference latency": [
@@ -547,6 +547,50 @@ window.BENCHMARK_DATA = {
             "name": "cpu+fusion distilgpt2/decode16 peak memory",
             "value": 4474.25,
             "unit": "MiB"
+          }
+        ]
+      }
+    ],
+    "Flex instruction counts": [
+      {
+        "commit": {
+          "author": {
+            "name": "kongxin",
+            "username": "kongxinjun",
+            "email": "kongxin326@gmail.com"
+          },
+          "committer": {
+            "name": "kongxin",
+            "username": "kongxinjun",
+            "email": "kongxin326@gmail.com"
+          },
+          "id": "1b1f3ec3f411a3d2a09c760bd380c5d6dcf843c3",
+          "message": "test(lab): judge fuzz findings with PyTorch and track confirmed bugs\n\nDump each failing program with its data so ci/oracle.py can tell which side\nis wrong, group panics by message, stop on environment failures, cap new\nissues per run, and add the permuted-reduction bug as a known-bug test. Move\nMetal to a self-hosted workflow: hosted macOS runners lack Metal 3.",
+          "timestamp": "2026-11-19T05:35:36Z",
+          "url": "https://github.com/kongxinjun/burn/commit/1b1f3ec3f411a3d2a09c760bd380c5d6dcf843c3"
+        },
+        "date": 1795068449206,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "flex mobilenet_v2/b1 instructions",
+            "value": 278824351.5,
+            "unit": "instructions"
+          },
+          {
+            "name": "flex resnet50/b1 instructions",
+            "value": 1680815669.5,
+            "unit": "instructions"
+          },
+          {
+            "name": "flex minilm/b4 instructions",
+            "value": 273370732,
+            "unit": "instructions"
+          },
+          {
+            "name": "flex distilgpt2/prefill instructions",
+            "value": 246185173,
+            "unit": "instructions"
           }
         ]
       }
