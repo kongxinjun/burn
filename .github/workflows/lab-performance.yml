@@ -48,6 +48,7 @@ jobs:
         with:
           burn-ref: ${{ inputs.burn-ref || 'main' }}
           cache-key: ${{ matrix.name }}
+          save-cache: "false"
           models: "true"
 
       - name: Measure
@@ -82,6 +83,7 @@ jobs:
         with:
           burn-ref: ${{ inputs.burn-ref || 'main' }}
           cache-key: flex
+          save-cache: "false"
           models: "true"
 
       - name: Count instructions
@@ -123,6 +125,7 @@ jobs:
         with:
           burn-ref: ${{ inputs.burn-ref || 'main' }}
           cache-key: ${{ matrix.name }}
+          save-cache: "false"
           models: "true"
 
       - name: Choose the base commit

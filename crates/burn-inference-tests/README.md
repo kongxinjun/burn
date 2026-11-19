@@ -25,10 +25,11 @@ workflows never run on pull requests, so code from other people's forks does not
 
 ## Triage
 
-`lab-fuzz` writes every failure with its whole program, and `ci/oracle.py` recomputes it with
-PyTorch. The verdict labels the issue: `device-wrong`, `flex-wrong` (Flex, the reference, is the
-buggy one), `both-wrong` or `pytorch-rejected`. A run opens at most five new issues, groups panics
-by message, and stops when most programs fail, which points to the environment.
+`lab-fuzz` and `lab-metal` write every failure with its whole program, and `ci/oracle.py`
+recomputes it with PyTorch. The verdict labels the issue: `device-wrong`, `flex-wrong` (Flex, the
+reference, is the buggy one), `both-wrong` or `pytorch-rejected`. A run opens at most five new
+issues, groups panics by message, and stops when most programs fail, which points to the
+environment.
 
 Confirmed bugs become tests in `tests/known_bugs.rs`, which CI runs in a step allowed to fail; a
 test that starts passing marks the fix. `LAB_SKIP` skips tests by name fragment for known

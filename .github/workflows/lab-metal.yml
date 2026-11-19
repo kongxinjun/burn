@@ -82,10 +82,19 @@ jobs:
           LAB_FEATURES: ${{ matrix.features }}
           SECONDS_TO_FUZZ: ${{ inputs.fuzz-seconds }}
         run: |
+          # Exit codes: 1 findings, 3 device unavailable, 4 too many failures to be bugs.
+          status=0
           ./target/release/lab-fuzz --seed $(( GITHUB_RUN_NUMBER * 1000000 + 500000000 )) \
-            --seconds "$SECONDS_TO_FUZZ" --findings "$GITHUB_WORKSPACE/findings" | tee -a "$GITHUB_STEP_SUMMARY" || true
+            --seconds "$SECONDS_TO_FUZZ" --findings "$GITHUB_WORKSPACE/findings" \
+            | tee -a "$GITHUB_STEP_SUMMARY" || status=${PIPESTATUS[0]}
+          if [ "$status" -gt 1 ]; then
+            echo "::error::The fuzzer stopped with status $status: the environment, not the programs, is failing"
+            exit "$status"
+          fi
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - name: Upload findings
+        if: success() || failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: findings-metal-${{ strategy.job-index }}
           path: findings
@@ -104,3 +113,11 @@ jobs:
         env:
           LAB_NORMAL_EXIT: "1"
         run: ./target/release/lab-bench --scenario mobilenet_v2/b1 --warmup 0 --iterations 1
+
+  report:
+    needs: metal
+    if: always()
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/lab-report.yml

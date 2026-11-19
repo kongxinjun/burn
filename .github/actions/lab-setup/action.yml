@@ -11,8 +11,15 @@ inputs:
     description: Where to check out upstream Burn.
     default: upstream
   cache-key:
-    description: Distinguishes the Rust build caches of different feature sets.
+    description: >-
+      Names the Rust build cache of a feature set. Jobs with the same key share one cache, whatever
+      their workflow.
     required: true
+  save-cache:
+    description: >-
+      Whether this job may save the Rust build cache. Only one workflow saves each key, so the
+      repository stays under its 10 GB cache limit.
+    default: "true"
   models:
     description: Whether to restore the exported models into `lab-models`.
     default: "false"
@@ -56,8 +63,8 @@ runs:
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         workspaces: ${{ inputs.path }} -> target
-        key: ${{ inputs.cache-key }}
-        save-if: ${{ github.ref == 'refs/heads/lab' }}
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/lab' && inputs.save-cache == 'true' }}
 
     - name: Restore the exported models
       if: inputs.models == 'true'
