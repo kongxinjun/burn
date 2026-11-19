@@ -13,6 +13,29 @@ pub const ACCELERATED: bool = cfg!(any(
     feature = "wgpu"
 ));
 
+/// Keeps CubeCL's environment, its autotune results and compiled kernels, in `directory` rather
+/// than in the cache every process on the machine shares, so a run depends only on what the
+/// directory holds. Records of how kernels were built are left out. Call it before the device is
+/// first used.
+pub fn isolate_environment(directory: &std::path::Path) {
+    #[cfg(any(feature = "cpu", feature = "cuda", feature = "metal", feature = "wgpu"))]
+    {
+        use burn::cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+
+        let config = serde_json::json!({
+            "environment": {
+                "path": { "directory": directory },
+                "records": { "level": "off" },
+            },
+        });
+        let config: CubeClRuntimeConfig =
+            serde_json::from_value(config).expect("The CubeCL configuration should deserialize");
+        CubeClRuntimeConfig::set(config);
+    }
+    #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "metal", feature = "wgpu")))]
+    let _ = directory;
+}
+
 /// The device selected by the enabled backend feature.
 pub fn device() -> Device {
     #[cfg(feature = "metal")]

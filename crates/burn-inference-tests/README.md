@@ -85,6 +85,12 @@ live elsewhere than `target/lab-models`.
   process; `lab-fuzz reduce <case> --out <path>` shrinks it, replaying each candidate in a new
   process, to the earlier runs, operations and values the failure needs, with random values
   replaced by short patterns when the failure survives it.
+- CubeCL keeps autotune results on disk and reuses them in every later process, so a failure can
+  also depend on what other processes tuned: a kernel chosen for one shape and reused for another.
+  Each `lab-fuzz` run therefore keeps its CubeCL environment in a directory of its own,
+  `<findings>/environment-<seed>`, which starts empty unless `--environment` names one to reuse.
+  Cases name it, and every replay starts from a copy of it; `--environment none` replays from an
+  empty one.
 
 The `fusion` feature turns fusion on; without it, the CubeCL backends run unfused. Burn's `default`
 feature would enable fusion everywhere, so this crate does not use it.

@@ -12,11 +12,11 @@ workspace = true
 
 [features]
 default = []
-cpu = ["burn/cpu"]
-cuda = ["burn/cuda"]
+cpu = ["burn/cpu", "burn/cubecl"]
+cuda = ["burn/cuda", "burn/cubecl"]
 fusion = ["burn/fusion"]
-metal = ["burn/metal"]
-wgpu = ["burn/wgpu"]
+metal = ["burn/metal", "burn/cubecl"]
+wgpu = ["burn/wgpu", "burn/cubecl"]
 
 [dependencies]
 # Not `default`: it enables fusion on every CubeCL backend, which the `fusion` feature controls here.

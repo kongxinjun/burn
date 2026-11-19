@@ -22,7 +22,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use burn::tensor::{Device, FloatDType, Tensor};
-use burn_inference_tests::harness::{ACCELERATED, backend_name, device, exit};
+use burn_inference_tests::harness::{ACCELERATED, backend_name, device, exit, isolate_environment};
 
 use program::{
     DTYPES, Disagreement, Input, Mode, Op, Program, Reference, dtype_name, judge, judged_program,
@@ -80,6 +80,8 @@ fn check(program: &Program, device: &Device, recorder: &mut Recorder) -> Outcome
 }
 
 struct Options {
+    /// CubeCL's environment for the run, by default a new one in the findings directory.
+    environment: Option<PathBuf>,
     seed: u64,
     programs: Option<u64>,
     duration: Duration,
@@ -91,6 +93,7 @@ struct Options {
 impl Options {
     fn parse() -> Self {
         let mut options = Self {
+            environment: None,
             seed: 0,
             programs: None,
             duration: Duration::from_secs(60),
@@ -127,6 +130,7 @@ impl Options {
                         .collect()
                 }
                 "--findings" => options.findings = PathBuf::from(value()),
+                "--environment" => options.environment = Some(PathBuf::from(value())),
                 _ => panic!("Unknown argument {arg}"),
             }
         }
@@ -262,6 +266,45 @@ fn open_device() -> Device {
     device
 }
 
+/// A new directory for CubeCL's environment, holding a copy of `source` when given: replays write
+/// tuning results, which must not reach the next replay.
+fn scratch_environment(source: Option<&Path>) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("The clock is after the epoch")
+        .as_nanos();
+    let scratch =
+        std::env::temp_dir().join(format!("lab-environment-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("The scratch environment should be writable");
+    if let Some(source) = source {
+        let entries = std::fs::read_dir(source)
+            .unwrap_or_else(|error| panic!("{} should be readable: {error}", source.display()));
+        for entry in entries {
+            let path = entry.expect("Environment entries are readable").path();
+            // The shared-memory index is rebuilt from the log when the database opens.
+            if path.is_file() && !path.to_string_lossy().ends_with("-shm") {
+                let name = path.file_name().expect("Files have names");
+                std::fs::copy(&path, scratch.join(name)).expect("The environment should copy");
+            }
+        }
+    }
+    scratch
+}
+
+/// The environment to replay `case` in: `requested`, unless it is `none`, or else the case's own.
+fn replay_environment(case: &Case, case_path: &Path, requested: Option<&str>) -> Option<PathBuf> {
+    match requested {
+        Some("none") => None,
+        Some(path) => Some(PathBuf::from(path)),
+        None => case.environment.as_ref().map(|environment| {
+            case_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(environment)
+        }),
+    }
+}
+
 fn read_case(path: &Path) -> Case {
     let json = std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("{} should be readable: {error}", path.display()));
@@ -275,25 +318,37 @@ fn write_json(path: &Path, value: &impl serde::Serialize) {
         .unwrap_or_else(|error| panic!("{} should be writable: {error}", path.display()));
 }
 
-/// `replay <case> [--program <path>]`: replays a case in this process and prints what its last
-/// run did as `REPLAY <json>`; `--program` writes that run for `ci/oracle.py`. Exits with 0 when it
-/// passes, 1 when it fails and 2 when Flex rejects it.
+/// `replay <case> [--program <path>] [--environment <directory>|none]`: replays a case in this
+/// process, starting from a copy of its CubeCL environment, and prints what its last run did as
+/// `REPLAY <json>`. `--program` writes that run for `ci/oracle.py`; `--environment` replaces the
+/// case's environment, or starts from an empty one. Exits with 0 when the run passes, 1 when it
+/// fails and 2 when Flex rejects it.
 fn replay_command(args: &[String]) -> ! {
     let mut args = args.iter();
-    let case = read_case(Path::new(args.next().expect("replay expects a case")));
-    let mut program_path = None;
+    let case_path = PathBuf::from(args.next().expect("replay expects a case"));
+    let case = read_case(&case_path);
+    let (mut program_path, mut requested) = (None, None);
     while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .unwrap_or_else(|| panic!("{arg} expects a value"))
+        };
         match arg.as_str() {
-            "--program" => program_path = Some(args.next().expect("--program expects a path")),
+            "--program" => program_path = Some(value()),
+            "--environment" => requested = Some(value().as_str()),
             _ => panic!("Unknown argument {arg}"),
         }
     }
+    let environment = replay_environment(&case, &case_path, requested);
+    let scratch = scratch_environment(environment.as_deref());
+    isolate_environment(&scratch);
     let device = open_device();
     std::panic::set_hook(Box::new(|_| {}));
     let (replay, judged) = session::replay(&case, &device);
     if let (Some(path), Some(judged)) = (program_path, judged) {
         write_json(Path::new(path), &judged);
     }
+    let _ = std::fs::remove_dir_all(&scratch);
     println!(
         "REPLAY {}",
         serde_json::to_string(&replay).expect("Replays serialize")
@@ -331,13 +386,14 @@ fn replay_elsewhere(case: &Case) -> Replay {
         })
 }
 
-/// `reduce <case> --out <path> [--tries <n>]`: shrinks a case to the runs, operations and values
-/// its failure needs, replaying each candidate in a new process up to `--tries` times.
+/// `reduce <case> --out <path> [--tries <n>] [--environment <directory>|none]`: shrinks a case to
+/// the runs, operations and values its failure needs, replaying each candidate in a new process up
+/// to `--tries` times. Every replay starts from a copy of the same environment.
 fn reduce_command(args: &[String]) -> ! {
     let mut args = args.iter();
-    let case = read_case(Path::new(args.next().expect("reduce expects a case")));
-    let mut out = None;
-    let mut tries = 2;
+    let case_path = PathBuf::from(args.next().expect("reduce expects a case"));
+    let mut case = read_case(&case_path);
+    let (mut out, mut tries, mut requested) = (None, 2, None);
     while let Some(arg) = args.next() {
         let mut value = || {
             args.next()
@@ -346,10 +402,15 @@ fn reduce_command(args: &[String]) -> ! {
         match arg.as_str() {
             "--out" => out = Some(PathBuf::from(value())),
             "--tries" => tries = value().parse().expect("--tries is a count"),
+            "--environment" => requested = Some(value().as_str()),
             _ => panic!("Unknown argument {arg}"),
         }
     }
     let out = out.expect("reduce expects --out");
+    // Candidates are written elsewhere, so they name the environment by its absolute path.
+    case.environment = replay_environment(&case, &case_path, requested).map(|environment| {
+        std::path::absolute(&environment).expect("The environment has an absolute path")
+    });
 
     let expected = replay_elsewhere(&case);
     if !matches!(expected.verdict, Verdict::Failed | Verdict::Crashed) {
@@ -385,6 +446,17 @@ fn reduce_command(args: &[String]) -> ! {
 }
 
 fn fuzz(mut options: Options) -> ! {
+    // A run starts from an empty environment unless told otherwise, so its findings hold every
+    // tuning result they depend on.
+    let environment = options.environment.clone().unwrap_or_else(|| {
+        let environment = options
+            .findings
+            .join(format!("environment-{}", options.seed));
+        let _ = std::fs::remove_dir_all(&environment);
+        environment
+    });
+    std::fs::create_dir_all(&environment).expect("The environment should be writable");
+    isolate_environment(&environment);
     let device = open_device();
     options.dtypes.retain(|&dtype| {
         let supported = device.supports_dtype(dtype);
@@ -406,7 +478,13 @@ fn fuzz(mut options: Options) -> ! {
     // Passed, failed and rejected programs per dtype.
     let mut counts = BTreeMap::<&str, [u64; 3]>::new();
     let mut resized = 0u64;
-    let mut recorder = Recorder::default();
+    // Cases sit in the findings directory and name the environment relative to it.
+    let environment = std::path::absolute(&environment).expect("Paths can be made absolute");
+    let relative = std::path::absolute(&options.findings)
+        .ok()
+        .and_then(|findings| environment.strip_prefix(findings).ok())
+        .map_or_else(|| environment.clone(), Path::to_path_buf);
+    let mut recorder = Recorder::new(Some(relative));
 
     // Panics are expected while reducing a failure; reports carry the messages.
     std::panic::set_hook(Box::new(|_| {}));

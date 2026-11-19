@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 
 use burn::tensor::{Device, FloatDType};
 use burn_inference_tests::harness::backend_name;
@@ -71,6 +72,10 @@ pub(crate) struct Case {
     pub(crate) dtypes: Vec<String>,
     pub(crate) programs: Vec<Source>,
     pub(crate) runs: Vec<Run>,
+    /// The CubeCL environment the process ran in, relative to the case: the autotune results it
+    /// held, which a replay starts from.
+    #[serde(default)]
+    pub(crate) environment: Option<PathBuf>,
 }
 
 impl Case {
@@ -141,14 +146,24 @@ impl Case {
 }
 
 /// Records the runs of a fuzzing process, by seed.
-#[derive(Default)]
 pub(crate) struct Recorder {
     programs: Vec<Source>,
     known: HashMap<(Origin, &'static str), usize>,
     runs: Vec<Run>,
+    environment: Option<PathBuf>,
 }
 
 impl Recorder {
+    /// Records a process whose CubeCL environment is `environment`, relative to its findings.
+    pub(crate) fn new(environment: Option<PathBuf>) -> Self {
+        Self {
+            programs: Vec::new(),
+            known: HashMap::new(),
+            runs: Vec::new(),
+            environment,
+        }
+    }
+
     pub(crate) fn record(&mut self, program: &Program, mode: Mode) {
         let programs = &mut self.programs;
         let index = match program.origin {
@@ -186,6 +201,7 @@ impl Recorder {
             dtypes: dtypes.iter().map(|d| dtype_name(*d).to_string()).collect(),
             programs,
             runs: self.runs.clone(),
+            environment: self.environment.clone(),
         }
     }
 }
