@@ -12,6 +12,7 @@
 //! cached kernels, tuning results and memory for it. A mismatch is reduced to the shortest failing
 //! prefix and written to `--findings` as JSON.
 
+mod emit;
 mod program;
 mod session;
 
@@ -242,6 +243,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("replay") => replay_command(&args[1..]),
         Some("reduce") => reduce_command(&args[1..]),
+        Some("emit") => emit_command(&args[1..]),
         _ => fuzz(Options::parse()),
     }
 }
@@ -442,6 +444,38 @@ fn reduce_command(args: &[String]) -> ! {
             .join(" -> "),
         expected.detail
     );
+    std::process::exit(0)
+}
+
+/// `emit <case> --out <directory> --burn <checkout> [--environment <directory>|none]`: writes the
+/// case as a standalone crate that depends on the Burn checkout and prints how the device differs
+/// from Flex. A case with an environment ships a copy of it.
+fn emit_command(args: &[String]) -> ! {
+    let mut args = args.iter();
+    let case_path = PathBuf::from(args.next().expect("emit expects a case"));
+    let case = read_case(&case_path);
+    let (mut out, mut burn, mut requested) = (None, None, None);
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .unwrap_or_else(|| panic!("{arg} expects a value"))
+        };
+        match arg.as_str() {
+            "--out" => out = Some(PathBuf::from(value())),
+            "--burn" => burn = Some(PathBuf::from(value())),
+            "--environment" => requested = Some(value().as_str()),
+            _ => panic!("Unknown argument {arg}"),
+        }
+    }
+    let out = out.expect("emit expects --out");
+    let environment = replay_environment(&case, &case_path, requested);
+    emit::emit(
+        &case,
+        environment.as_deref(),
+        &burn.expect("emit expects --burn"),
+        &out,
+    );
+    println!("Wrote {}", out.display());
     std::process::exit(0)
 }
 

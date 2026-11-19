@@ -91,6 +91,10 @@ live elsewhere than `target/lab-models`.
   `<findings>/environment-<seed>`, which starts empty unless `--environment` names one to reuse.
   Cases name it, and every replay starts from a copy of it; `--environment none` replays from an
   empty one.
+- `lab-fuzz emit <case> --out <directory> --burn <checkout>` writes a case as a standalone crate
+  that uses only Burn's public API from that checkout, runs the failing program on the device and
+  on Flex, and prints how they differ. A case that needs its environment ships a copy and points
+  CubeCL at it.
 
 The `fusion` feature turns fusion on; without it, the CubeCL backends run unfused. Burn's `default`
 feature would enable fusion everywhere, so this crate does not use it.
