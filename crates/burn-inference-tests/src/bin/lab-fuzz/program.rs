@@ -7,7 +7,7 @@ use burn::tensor::module::{
 };
 use burn::tensor::ops::{AvgPoolOptions, ConvOptions, MaxPoolOptions};
 use burn::tensor::{DType, Device, FloatDType, Int, Tensor, TensorData, bf16, f16};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub(crate) const MAX_ELEMENTS: usize = 1 << 16;
@@ -26,6 +26,33 @@ pub(crate) fn dtype_name(dtype: FloatDType) -> &'static str {
         .find(|(_, candidate)| *candidate == dtype)
         .map(|(name, _)| *name)
         .expect("Programs run in a dtype of DTYPES")
+}
+
+/// The dtype of `DTYPES` named `name`.
+pub(crate) fn parse_dtype(name: &str) -> Option<FloatDType> {
+    DTYPES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, dtype)| *dtype)
+}
+
+/// Serializes a float dtype by its name in `DTYPES`.
+pub(crate) mod dtype_by_name {
+    use super::*;
+
+    pub(crate) fn serialize<S: Serializer>(
+        dtype: &FloatDType,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(dtype_name(*dtype))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<FloatDType, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        parse_dtype(&name).ok_or_else(|| serde::de::Error::custom(format!("unknown dtype {name}")))
+    }
 }
 
 /// The nearest value of `dtype` to `value`.
@@ -77,7 +104,7 @@ impl Rng {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) enum Unary {
     Relu,
     Abs,
@@ -93,7 +120,7 @@ pub(crate) enum Unary {
     Square,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) enum Binary {
     Add,
     Sub,
@@ -103,7 +130,7 @@ pub(crate) enum Binary {
     SafeDiv,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) enum Reduce {
     Sum,
     Mean,
@@ -111,7 +138,7 @@ pub(crate) enum Reduce {
     Min,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Op {
     Unary(Unary),
     Scalar {
@@ -600,20 +627,32 @@ pub(crate) fn output_shape(op: &Op, shape: [usize; 4]) -> Option<[usize; 4]> {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Input {
     pub(crate) shape: [usize; 4],
     pub(crate) data: Vec<f32>,
 }
 
 /// Random operations applied to one input, in one float dtype.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Program {
+    #[serde(with = "dtype_by_name")]
     pub(crate) dtype: FloatDType,
     pub(crate) input: Input,
     pub(crate) ops: Vec<Op>,
     /// An input with another batch size, when every operation is independent of it.
     pub(crate) resized: Option<Input>,
+    /// The seed the program was generated from, so a session can be recorded without its data.
+    #[serde(skip)]
+    pub(crate) origin: Option<Origin>,
+}
+
+/// Where a generated program comes from: `Program::generate` with `seed`, cut to `length`
+/// operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Origin {
+    pub(crate) seed: u64,
+    pub(crate) length: usize,
 }
 
 impl Program {
@@ -647,6 +686,7 @@ impl Program {
             input: Input { shape, data },
             ops,
             resized: None,
+            origin: None,
         };
         program.resized = program.resize(&mut variant);
         // The reference and the device start from the same values, so only the computation rounds.
@@ -657,6 +697,10 @@ impl Program {
         for op in &mut program.ops {
             op.map_constants(round);
         }
+        program.origin = Some(Origin {
+            seed,
+            length: program.ops.len(),
+        });
         program
     }
 
@@ -688,8 +732,126 @@ impl Program {
     pub(crate) fn prefix(&self, length: usize) -> Self {
         let mut prefix = self.clone();
         prefix.ops.truncate(length);
+        if let Some(origin) = &mut prefix.origin {
+            origin.length = prefix.ops.len();
+        }
         prefix
     }
+
+    /// Whether every operation's constants fit the shape it receives, from both inputs.
+    pub(crate) fn is_valid(&self) -> bool {
+        let fits = |input: &Input| {
+            input.data.len() == numel(&input.shape)
+                && self
+                    .ops
+                    .iter()
+                    .try_fold(input.shape, |shape, op| fitted_shape(op, shape))
+                    .is_some()
+        };
+        fits(&self.input) && self.resized.as_ref().is_none_or(fits)
+    }
+
+    /// The program with its random values replaced by `pattern`s of the same magnitude and its
+    /// indices by `cycle`s, which a reproduction can write in a line.
+    pub(crate) fn patterned(&self) -> Self {
+        let mut program = self.clone();
+        let dtype = self.dtype;
+        let replace = |values: &mut Vec<f32>, salt: usize| {
+            *values = pattern(values.len(), salt, pattern_scale(values))
+                .into_iter()
+                .map(|value| round_to(dtype, value))
+                .collect();
+        };
+        replace(&mut program.input.data, 0);
+        if let Some(resized) = &mut program.resized {
+            replace(&mut resized.data, 1);
+        }
+        let mut shape = program.input.shape;
+        for (index, op) in program.ops.iter_mut().enumerate() {
+            let salt = 2 + 2 * index;
+            match op {
+                Op::Broadcast { data, .. } | Op::Matmul { data, .. } => replace(data, salt),
+                Op::Conv { weight, bias, .. } => {
+                    replace(weight, salt);
+                    if let Some(bias) = bias {
+                        replace(bias, salt + 1);
+                    }
+                }
+                Op::Select { dim, indices } | Op::Gather { dim, indices, .. } => {
+                    *indices = cycle(indices.len(), shape[*dim]);
+                }
+                _ => {}
+            }
+            shape = output_shape(op, shape).expect("Valid programs have an output shape");
+        }
+        program
+    }
+}
+
+/// Deterministic values in `[-scale, scale]`, spread like random ones.
+pub(crate) fn pattern(count: usize, salt: usize, scale: f32) -> Vec<f32> {
+    (0..count)
+        .map(|i| (((i * 37 + salt * 101) % 199) as f32 / 99.0 - 1.0) * scale)
+        .collect()
+}
+
+/// The magnitude of `values`, rounded to a twentieth so it prints short.
+pub(crate) fn pattern_scale(values: &[f32]) -> f32 {
+    let largest = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    ((largest * 20.0).round() / 20.0).max(0.05)
+}
+
+/// The indices `0, 1, .., bound - 1, 0, 1, ..`, `count` of them.
+pub(crate) fn cycle(count: usize, bound: usize) -> Vec<i64> {
+    (0..count).map(|i| (i % bound) as i64).collect()
+}
+
+/// The shape `op` produces from `shape`, when its constants fit that shape.
+pub(crate) fn fitted_shape(op: &Op, shape: [usize; 4]) -> Option<[usize; 4]> {
+    let [n, c, _, w] = shape;
+    let in_bounds =
+        |indices: &[i64], bound: usize| indices.iter().all(|&i| (0..bound as i64).contains(&i));
+    let fits = match op {
+        Op::Broadcast {
+            shape: other, data, ..
+        } => data.len() == numel(other) && other.iter().zip(&shape).all(|(o, s)| *o == 1 || o == s),
+        Op::Conv {
+            channels_out,
+            kernel,
+            groups,
+            weight,
+            bias,
+            ..
+        } => {
+            c % groups == 0
+                && channels_out % groups == 0
+                && weight.len() == channels_out * (c / groups) * kernel[0] * kernel[1]
+                && bias.as_ref().is_none_or(|bias| bias.len() == *channels_out)
+        }
+        Op::Matmul {
+            shape: rhs, data, ..
+        } => {
+            data.len() == numel(rhs)
+                && rhs[2] == w
+                && (rhs[0] == 1 || rhs[0] == n)
+                && (rhs[1] == 1 || rhs[1] == c)
+        }
+        Op::Narrow { dim, start, length } => start + length <= shape[*dim],
+        Op::Select { dim, indices } => in_bounds(indices, shape[*dim]),
+        Op::Gather {
+            dim,
+            shape: gathered,
+            indices,
+        } => {
+            (0..4).all(|d| d == *dim || gathered[d] == shape[d])
+                && indices.len() == numel(gathered)
+                && in_bounds(indices, shape[*dim])
+        }
+        Op::Reshape(dims) => numel(dims) == numel(&shape),
+        _ => true,
+    };
+    let output = output_shape(op, shape)?;
+    (fits && within_limits(&output)).then_some(output)
 }
 
 pub(crate) fn float<const D: usize>(
@@ -886,6 +1048,90 @@ pub(crate) fn execute(
         .convert::<f32>()
         .try_into_vec::<f32>()
         .expect("The output should be f32")
+}
+
+/// How one run on the device under test disagrees with its reference.
+#[derive(Clone, Debug)]
+pub(crate) struct Disagreement {
+    /// The device's outputs, unless it panicked.
+    pub(crate) outputs: Option<Vec<f32>>,
+    pub(crate) detail: String,
+    pub(crate) panicked: bool,
+}
+
+/// Runs `program` once on `input` and compares its outputs with `reference`.
+pub(crate) fn judge(
+    program: &Program,
+    input: &Input,
+    reference: &Reference,
+    device: &Device,
+    mode: Mode,
+) -> Result<Vec<f32>, Disagreement> {
+    let outputs = catch_unwind(AssertUnwindSafe(|| {
+        execute(input, &program.ops, device, program.dtype, mode)
+    }))
+    .map_err(|payload| Disagreement {
+        outputs: None,
+        detail: panic_message(payload.as_ref()),
+        panicked: true,
+    })?;
+    if outputs.len() != reference.expected.len() {
+        let detail = format!(
+            "{} elements, expected {}",
+            outputs.len(),
+            reference.expected.len()
+        );
+        return Err(Disagreement {
+            outputs: Some(outputs),
+            detail,
+            panicked: true,
+        });
+    }
+    if let Some((index, actual, expected)) = reference.violation(&outputs) {
+        return Err(Disagreement {
+            outputs: Some(outputs),
+            detail: format!("element {index}: {actual} instead of {expected}"),
+            panicked: false,
+        });
+    }
+    Ok(outputs)
+}
+
+/// A hash of `message` without its numbers, which vary between runs.
+pub(crate) fn message_hash(message: &str) -> u32 {
+    let first_lines = message.lines().take(12).collect::<String>();
+    first_lines
+        .bytes()
+        .filter(|byte| !byte.is_ascii_digit())
+        .fold(0x811c_9dc5u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        })
+}
+
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// The program and outputs of a failing run, in the format `ci/oracle.py` judges.
+pub(crate) fn judged_program(
+    program: &Program,
+    input: &Input,
+    reference: &Reference,
+    outputs: Option<&[f32]>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "dtype": dtype_name(program.dtype),
+        "slack": reference.slack,
+        "input_shape": input.shape,
+        "input": input.data,
+        "ops": program.ops,
+        "flex": reference.expected,
+        "device": outputs,
+    })
 }
 
 /// The largest finite magnitude of `values`, at least 1: errors are measured against it.

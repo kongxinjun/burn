@@ -30,7 +30,7 @@ def main(findings, run_url):
     judged = verdicts()
     rows = {}
     for path in sorted(Path(findings).glob("**/*.json")):
-        if path.name.endswith(".program.json"):
+        if path.name.endswith((".program.json", ".case.json")):
             continue
         finding = json.loads(path.read_text())
         program = str(path.with_name(path.name.removesuffix(".json") + ".program.json"))

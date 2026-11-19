@@ -79,6 +79,12 @@ live elsewhere than `target/lab-models`.
   add; programs that overflow or lose most of their precision are skipped. A mismatch is reduced to
   its shortest failing prefix and written as JSON with the command that reproduces it. Fingerprints
   name the dtype only when the program passes in f32.
+- Each finding also has a `.case.json`: the session of the process up to the failure, every run it
+  made on the device, by seed. A failure can depend on kernels, tuning results or memory left by
+  earlier programs, and only reproduces with them. `lab-fuzz replay <case>` replays a case in a new
+  process; `lab-fuzz reduce <case> --out <path>` shrinks it, replaying each candidate in a new
+  process, to the earlier runs, operations and values the failure needs, with random values
+  replaced by short patterns when the failure survives it.
 
 The `fusion` feature turns fusion on; without it, the CubeCL backends run unfused. Burn's `default`
 feature would enable fusion everywhere, so this crate does not use it.

@@ -13,26 +13,29 @@
 //! prefix and written to `--findings` as JSON.
 
 mod program;
+mod session;
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use burn::tensor::{Device, FloatDType, Tensor};
 use burn_inference_tests::harness::{ACCELERATED, backend_name, device, exit};
 
-use program::{DTYPES, Input, Mode, Op, Program, Reference, dtype_name, execute};
+use program::{
+    DTYPES, Disagreement, Input, Mode, Op, Program, Reference, dtype_name, judge, judged_program,
+    message_hash, panic_message,
+};
+use session::{Case, Recorder, Replay, Verdict};
 
 /// A run of a program on the device under test that disagrees with the reference.
 struct Failure {
     mode: Mode,
     input: Input,
     reference: Reference,
-    /// The device's outputs, unless it panicked.
-    outputs: Option<Vec<f32>>,
-    detail: String,
-    panicked: bool,
+    disagreement: Disagreement,
 }
 
 enum Outcome {
@@ -41,26 +44,8 @@ enum Outcome {
     Failed(Box<Failure>),
 }
 
-/// A hash of `message` without its numbers, which vary between runs.
-fn message_hash(message: &str) -> u32 {
-    let first_lines = message.lines().take(12).collect::<String>();
-    first_lines
-        .bytes()
-        .filter(|byte| !byte.is_ascii_digit())
-        .fold(0x811c_9dc5u32, |hash, byte| {
-            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
-        })
-}
-
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
-        .unwrap_or_else(|| "unknown panic".to_string())
-}
-
-fn check(program: &Program, device: &Device) -> Outcome {
+/// Runs `program` in every mode, recording each run, until one disagrees with Flex.
+fn check(program: &Program, device: &Device, recorder: &mut Recorder) -> Outcome {
     let Some(reference) = Reference::compute(program, &program.input) else {
         return Outcome::Invalid;
     };
@@ -81,33 +66,14 @@ fn check(program: &Program, device: &Device) -> Outcome {
     runs.push((Mode::Again, &program.input, &reference));
 
     for (mode, input, reference) in runs {
-        let failure = |outputs, detail, panicked| {
-            Outcome::Failed(Box::new(Failure {
+        recorder.record(program, mode);
+        if let Err(disagreement) = judge(program, input, reference, device, mode) {
+            return Outcome::Failed(Box::new(Failure {
                 mode,
                 input: input.clone(),
                 reference: reference.clone(),
-                outputs,
-                detail,
-                panicked,
-            }))
-        };
-        let outputs = match catch_unwind(AssertUnwindSafe(|| {
-            execute(input, &program.ops, device, program.dtype, mode)
-        })) {
-            Ok(outputs) => outputs,
-            Err(payload) => return failure(None, panic_message(payload.as_ref()), true),
-        };
-        if outputs.len() != reference.expected.len() {
-            let detail = format!(
-                "{} elements, expected {}",
-                outputs.len(),
-                reference.expected.len()
-            );
-            return failure(Some(outputs), detail, true);
-        }
-        if let Some((index, actual, expected)) = reference.violation(&outputs) {
-            let detail = format!("element {index}: {actual} instead of {expected}");
-            return failure(Some(outputs), detail, false);
+                disagreement,
+            }));
         }
     }
     Outcome::Passed
@@ -168,35 +134,41 @@ impl Options {
     }
 }
 
+/// Writes a finding for `failure` of `program`, whose session so far is `case`.
 fn report(
     options: &Options,
     seed: u64,
     program: &Program,
     device: &Device,
+    recorder: &mut Recorder,
     failure: Failure,
+    case: Case,
 ) -> String {
-    // The shortest prefix that still fails is the reproduction.
-    let (program, failure) = (1..=program.ops.len())
+    // The shortest prefix that still fails is the reproduction, with the session up to its failure.
+    let (program, failure, case) = (1..=program.ops.len())
         .find_map(|length| {
             let prefix = program.prefix(length);
-            match check(&prefix, device) {
-                Outcome::Failed(failure) => Some((prefix, *failure)),
+            match check(&prefix, device, recorder) {
+                Outcome::Failed(failure) => {
+                    let case = recorder.case(&prefix, options.max_ops, &options.dtypes);
+                    Some((prefix, *failure, case))
+                }
                 Outcome::Passed | Outcome::Invalid => None,
             }
         })
-        .unwrap_or_else(|| (program.clone(), failure));
+        .unwrap_or_else(|| (program.clone(), failure, case));
     let culprit = program.ops.last().expect("Programs have operations");
     let backend = backend_name();
     let dtype = dtype_name(program.dtype);
     let mode = failure.mode;
-    let kind = if failure.panicked {
+    let kind = if failure.disagreement.panicked {
         "panic"
     } else {
         "mismatch"
     };
     // Panics share their cause across operations, so they are told apart by message.
-    let subject = match failure.panicked {
-        true => format!("{:08x}", message_hash(&failure.detail)),
+    let subject = match failure.disagreement.panicked {
+        true => format!("{:08x}", message_hash(&failure.disagreement.detail)),
         false => culprit.kind(),
     };
     // Only failures specific to a lower precision name it, so a bug found in every dtype gets one
@@ -206,7 +178,7 @@ fn report(
         ..program.clone()
     };
     let precision = match program.dtype == FloatDType::F32
-        || matches!(check(&in_f32, device), Outcome::Failed(_))
+        || matches!(check(&in_f32, device, recorder), Outcome::Failed(_))
     {
         true => String::new(),
         false => format!("-{dtype}"),
@@ -224,7 +196,7 @@ fn report(
         "burn_sha": std::env::var("LAB_BURN_SHA").unwrap_or_else(|_| "local".to_string()),
         "mode": format!("{mode:?}"),
         "failure": kind,
-        "detail": failure.detail,
+        "detail": failure.disagreement.detail,
         "seed": seed,
         "input_shape": failure.input.shape,
         "culprit": culprit.describe(),
@@ -232,32 +204,46 @@ fn report(
         "reproduce": format!("cargo run --release --bin lab-fuzz --features {features} -- --seed {seed} --programs 1 --max-ops {} --dtypes {dtype}", options.max_ops),
     });
     std::fs::create_dir_all(&options.findings).expect("The findings directory should be writable");
-    let judged = serde_json::json!({
-        "dtype": dtype,
-        "slack": failure.reference.slack,
-        "input_shape": failure.input.shape,
-        "input": failure.input.data,
-        "ops": program.ops,
-        "flex": failure.reference.expected,
-        "device": failure.outputs,
-    });
+    let judged = judged_program(
+        &program,
+        &failure.input,
+        &failure.reference,
+        failure.disagreement.outputs.as_deref(),
+    );
     std::fs::write(
         options.findings.join(format!("{fingerprint}.program.json")),
         serde_json::to_string(&judged).expect("Programs serialize"),
     )
     .expect("The program should be writable");
+    std::fs::write(
+        options.findings.join(format!("{fingerprint}.case.json")),
+        serde_json::to_string(&case).expect("Cases serialize"),
+    )
+    .expect("The case should be writable");
     let path = options.findings.join(format!("{fingerprint}.json"));
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&finding).expect("Findings serialize"),
     )
     .expect("The finding should be writable");
-    println!("FINDING {fingerprint} (seed {seed}, {})", failure.detail);
+    println!(
+        "FINDING {fingerprint} (seed {seed}, {})",
+        failure.disagreement.detail
+    );
     fingerprint
 }
 
 fn main() {
-    let mut options = Options::parse();
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
+        Some("replay") => replay_command(&args[1..]),
+        Some("reduce") => reduce_command(&args[1..]),
+        _ => fuzz(Options::parse()),
+    }
+}
+
+/// The device under test, once it has run an operation.
+fn open_device() -> Device {
     if !ACCELERATED {
         eprintln!("Fuzzing compares another backend with Flex: enable a backend feature");
         exit(2);
@@ -273,6 +259,133 @@ fn main() {
         );
         exit(3);
     }
+    device
+}
+
+fn read_case(path: &Path) -> Case {
+    let json = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{} should be readable: {error}", path.display()));
+    serde_json::from_str(&json)
+        .unwrap_or_else(|error| panic!("{} should hold a case: {error}", path.display()))
+}
+
+fn write_json(path: &Path, value: &impl serde::Serialize) {
+    let json = serde_json::to_string(value).expect("Values serialize");
+    std::fs::write(path, json)
+        .unwrap_or_else(|error| panic!("{} should be writable: {error}", path.display()));
+}
+
+/// `replay <case> [--program <path>]`: replays a case in this process and prints what its last
+/// run did as `REPLAY <json>`; `--program` writes that run for `ci/oracle.py`. Exits with 0 when it
+/// passes, 1 when it fails and 2 when Flex rejects it.
+fn replay_command(args: &[String]) -> ! {
+    let mut args = args.iter();
+    let case = read_case(Path::new(args.next().expect("replay expects a case")));
+    let mut program_path = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--program" => program_path = Some(args.next().expect("--program expects a path")),
+            _ => panic!("Unknown argument {arg}"),
+        }
+    }
+    let device = open_device();
+    std::panic::set_hook(Box::new(|_| {}));
+    let (replay, judged) = session::replay(&case, &device);
+    if let (Some(path), Some(judged)) = (program_path, judged) {
+        write_json(Path::new(path), &judged);
+    }
+    println!(
+        "REPLAY {}",
+        serde_json::to_string(&replay).expect("Replays serialize")
+    );
+    exit(match replay.verdict {
+        Verdict::Passed => 0,
+        Verdict::Failed | Verdict::Crashed => 1,
+        Verdict::Invalid => 2,
+    })
+}
+
+/// Replays `case` in a new process, so it starts from a fresh device.
+fn replay_elsewhere(case: &Case) -> Replay {
+    let path = std::env::temp_dir().join(format!("lab-fuzz-{}.case.json", std::process::id()));
+    write_json(&path, case);
+    let executable = std::env::current_exe().expect("The fuzzer knows its executable");
+    let output = Command::new(executable)
+        .arg("replay")
+        .arg(&path)
+        .output()
+        .expect("The fuzzer should start a replay");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("REPLAY "))
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_else(|| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail = stderr.lines().rev().take(5).collect::<Vec<_>>();
+            Replay {
+                verdict: Verdict::Crashed,
+                panicked: true,
+                detail: format!("{}: {}", output.status, tail.join(" / ")),
+            }
+        })
+}
+
+/// `reduce <case> --out <path> [--tries <n>]`: shrinks a case to the runs, operations and values
+/// its failure needs, replaying each candidate in a new process up to `--tries` times.
+fn reduce_command(args: &[String]) -> ! {
+    let mut args = args.iter();
+    let case = read_case(Path::new(args.next().expect("reduce expects a case")));
+    let mut out = None;
+    let mut tries = 2;
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .unwrap_or_else(|| panic!("{arg} expects a value"))
+        };
+        match arg.as_str() {
+            "--out" => out = Some(PathBuf::from(value())),
+            "--tries" => tries = value().parse().expect("--tries is a count"),
+            _ => panic!("Unknown argument {arg}"),
+        }
+    }
+    let out = out.expect("reduce expects --out");
+
+    let expected = replay_elsewhere(&case);
+    if !matches!(expected.verdict, Verdict::Failed | Verdict::Crashed) {
+        println!("The case does not reproduce: {expected:?}");
+        std::process::exit(3);
+    }
+    let start = Instant::now();
+    let mut replays = 0;
+    let reduced = session::reduce(case.clone(), |candidate| {
+        (0..tries).any(|_| {
+            replays += 1;
+            replay_elsewhere(candidate).fails_like(&expected)
+        })
+    });
+    write_json(&out, &reduced);
+    let programs = reduced.programs();
+    let target = &programs[reduced.runs.last().expect("Cases have a run").program];
+    println!(
+        "Reduced in {replays} replays and {:.0?}: {} runs to {}, {} operations, {} ({})",
+        start.elapsed(),
+        case.runs.len(),
+        reduced.runs.len(),
+        target.ops.len(),
+        target
+            .ops
+            .iter()
+            .map(Op::describe)
+            .collect::<Vec<_>>()
+            .join(" -> "),
+        expected.detail
+    );
+    std::process::exit(0)
+}
+
+fn fuzz(mut options: Options) -> ! {
+    let device = open_device();
     options.dtypes.retain(|&dtype| {
         let supported = device.supports_dtype(dtype);
         if !supported {
@@ -293,6 +406,7 @@ fn main() {
     // Passed, failed and rejected programs per dtype.
     let mut counts = BTreeMap::<&str, [u64; 3]>::new();
     let mut resized = 0u64;
+    let mut recorder = Recorder::default();
 
     // Panics are expected while reducing a failure; reports carry the messages.
     std::panic::set_hook(Box::new(|_| {}));
@@ -307,12 +421,21 @@ fn main() {
         let program = Program::generate(seed, options.max_ops, &options.dtypes);
         let count = counts.entry(dtype_name(program.dtype)).or_default();
         resized += u64::from(program.resized.is_some());
-        match check(&program, &device) {
+        match check(&program, &device, &mut recorder) {
             Outcome::Passed => count[0] += 1,
             Outcome::Invalid => count[2] += 1,
             Outcome::Failed(failure) => {
                 count[1] += 1;
-                fingerprints.insert(report(&options, seed, &program, &device, *failure));
+                let case = recorder.case(&program, options.max_ops, &options.dtypes);
+                fingerprints.insert(report(
+                    &options,
+                    seed,
+                    &program,
+                    &device,
+                    &mut recorder,
+                    *failure,
+                    case,
+                ));
             }
         }
     }
