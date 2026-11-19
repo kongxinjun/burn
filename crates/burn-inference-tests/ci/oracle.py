@@ -4,6 +4,9 @@
 # ///
 """Recomputes lab-fuzz programs with PyTorch to tell which backend is wrong.
 
+PyTorch computes in f32 from the program's values, already rounded to its dtype; outputs may differ
+from it by the program's `slack` on top of the f32 tolerance, as in the fuzzer.
+
 Usage: oracle.py <program.json>...   Prints one JSON verdict per program.
 """
 
@@ -124,7 +127,7 @@ def apply(op, x):
     raise ValueError(f"Unknown operation {kind}")
 
 
-def agrees(actual, expected):
+def agrees(actual, expected, slack):
     """The fuzzer's comparison: NaN matches NaN, errors scale with the largest finite value."""
     if actual is None or len(actual) != len(expected):
         return False
@@ -138,7 +141,7 @@ def agrees(actual, expected):
         elif math.isinf(a) or math.isinf(e):
             if a != e:
                 return False
-        elif abs(a - e) > 2e-3 * scale + 2e-3 * abs(e):
+        elif abs(a - e) > slack + 2e-3 * scale + 2e-3 * abs(e):
             return False
     return True
 
@@ -154,7 +157,9 @@ def verdict(path):
         return {"program": path, "verdict": "pytorch-rejected", "detail": str(error)[:300]}
 
     expected = x.flatten().tolist()
-    flex, device = agrees(program["flex"], expected), agrees(program["device"], expected)
+    slack = program.get("slack", 0.0)
+    flex = agrees(program["flex"], expected, slack)
+    device = agrees(program["device"], expected, slack)
     name = {
         (True, False): "device-wrong",
         (False, True): "flex-wrong",

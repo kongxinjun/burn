@@ -67,10 +67,14 @@ live elsewhere than `target/lab-models`.
 
 - `lab-bench` measures load time, first request, p50 and p90 latency, and peak memory per
   scenario. Every request reads its output back, so timings include execution.
-- `lab-fuzz` builds random chains of tensor and module operations and runs each one lazily, letting
-  fusion see the whole chain, and eagerly, synchronizing after every operation. A mismatch with
-  Flex is reduced to its shortest failing prefix and written as JSON with the command that
-  reproduces it.
+- `lab-fuzz` builds random chains of tensor and module operations in f32, f16 or bf16 (`--dtypes`)
+  and runs each one lazily, letting fusion see the whole chain; eagerly, synchronizing after every
+  operation; on another batch size when no operation depends on it; and lazily again, once kernels,
+  tuning results and memory are cached. Flex in f32 is the reference. For f16 and bf16, Flex also
+  runs the program in that precision, and its distance from f32 sets how much error the device may
+  add; programs that overflow or lose most of their precision are skipped. A mismatch is reduced to
+  its shortest failing prefix and written as JSON with the command that reproduces it. Fingerprints
+  name the dtype only when the program passes in f32.
 
 The `fusion` feature turns fusion on; without it, the CubeCL backends run unfused. Burn's `default`
 feature would enable fusion everywhere, so this crate does not use it.

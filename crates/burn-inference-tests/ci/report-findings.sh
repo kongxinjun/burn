@@ -34,7 +34,7 @@ for file in "$findings"/**/*.json; do
   reported[$fingerprint]=1
 
   body=$(jq -r --arg run "$RUN_URL" --arg verdict "$verdict" '
-    "**Backend:** `\(.backend)`, \(.mode | ascii_downcase) execution\n" +
+    "**Backend:** `\(.backend)`, \(.mode | ascii_downcase) execution in \(.dtype // "f32")\n" +
     "**Failure:** \(.failure): \(.detail | .[0:1500])\n" +
     "**PyTorch verdict:** \($verdict)\n" +
     "**Upstream Burn:** tracel-ai/burn@\(.burn_sha)\n" +
