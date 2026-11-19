@@ -1253,6 +1253,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-inference-tests"
+version = "0.23.0-pre.2"
+dependencies = [
+ "burn",
+ "burn-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "burn-instrument"
 version = "0.23.0-pre.2"
 dependencies = [

@@ -1,0 +1,29 @@
+[package]
+description = "End-to-end inference tests for Burn models"
+edition.workspace = true
+license.workspace = true
+name = "burn-inference-tests"
+publish = false
+readme = "README.md"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+cpu = ["burn/cpu"]
+cuda = ["burn/cuda"]
+fusion = ["burn/fusion"]
+metal = ["burn/metal"]
+wgpu = ["burn/wgpu"]
+
+[dependencies]
+burn = { workspace = true, features = ["default", "flex"] }
+burn-store = { workspace = true, features = ["default", "std", "safetensors"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[[test]]
+harness = false
+name = "inference"

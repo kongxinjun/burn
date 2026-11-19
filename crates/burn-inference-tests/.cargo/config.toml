@@ -1,0 +1,12 @@
+[alias]
+test-flex = "test --release --test inference"
+test-cpu = "test --release --test inference --features cpu,fusion"
+test-cuda = "test --release --test inference --features cuda,fusion"
+test-metal = "test --release --test inference --features metal,fusion"
+test-wgpu = "test --release --test inference --features wgpu,fusion"
+
+# Fusion disabled tests
+test-cpu-no-fusion = "test --release --test inference --features cpu"
+test-cuda-no-fusion = "test --release --test inference --features cuda"
+test-metal-no-fusion = "test --release --test inference --features metal"
+test-wgpu-no-fusion = "test --release --test inference --features wgpu"
