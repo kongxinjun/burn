@@ -1,13 +1,12 @@
 name: lab-report
 
-# Judges the `findings-*` artifacts of the calling run with PyTorch and files an issue per finding.
-# The caller grants `issues: write`.
+# Judges the `findings-*` artifacts of the calling run with PyTorch and lists them in the job
+# summary. It opens no issue: issues are opened by hand once a bug is confirmed.
 on:
   workflow_call:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   report:
@@ -35,9 +34,7 @@ jobs:
             uv run crates/burn-inference-tests/ci/oracle.py "${programs[@]}" | tee verdicts.jsonl
           fi
 
-      - name: File or update an issue per finding
+      - name: List the findings
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: crates/burn-inference-tests/ci/report-findings.sh findings
+        run: python3 crates/burn-inference-tests/ci/summarize_findings.py findings "$RUN_URL" >> "$GITHUB_STEP_SUMMARY"

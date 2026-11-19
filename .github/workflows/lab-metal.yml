@@ -117,7 +117,4 @@ jobs:
   report:
     needs: metal
     if: always()
-    permissions:
-      contents: read
-      issues: write
     uses: ./.github/workflows/lab-report.yml

@@ -9,8 +9,8 @@ the fork and runs on GitHub Actions against the latest upstream `main`: every jo
 | Workflow | When | What it does |
 | --- | --- | --- |
 | `lab-functional` | Every push to `lab`, daily | Small and pretrained models on Flex (Linux and macOS), CubeCL CPU and wgpu (lavapipe), with and without fusion, plus the known-bug tests |
-| `lab-fuzz` | Every 6 hours | Random inference programs on CubeCL CPU and wgpu against Flex; PyTorch judges each failure, and each distinct one gets an issue |
-| `lab-performance` | Daily | Latency and memory history on GitHub Pages, Callgrind instruction counts, and a same-machine comparison with the previous day's Burn that files an issue on regression |
+| `lab-fuzz` | Every 6 hours | Random inference programs on CubeCL CPU and wgpu against Flex; PyTorch judges each failure, and the distinct ones are listed in the job summary |
+| `lab-performance` | Daily | Latency and memory history on GitHub Pages, Callgrind instruction counts, and a same-machine comparison with the previous day's Burn that flags regressions |
 | `lab-sanitizers` | Weekly | AddressSanitizer on the suites, ThreadSanitizer on the concurrency tests |
 | `lab-metal` | By hand | Everything above on Metal, on a self-hosted runner labelled `metal` |
 
@@ -26,10 +26,14 @@ workflows never run on pull requests, so code from other people's forks does not
 ## Triage
 
 `lab-fuzz` and `lab-metal` write every failure with its whole program, and `ci/oracle.py`
-recomputes it with PyTorch. The verdict labels the issue: `device-wrong`, `flex-wrong` (Flex, the
-reference, is the buggy one), `both-wrong` or `pytorch-rejected`. A run opens at most five new
-issues, groups panics by message, and stops when most programs fail, which points to the
-environment.
+recomputes it with PyTorch. The verdict is `device-wrong`, `flex-wrong` (Flex, the reference, is
+the buggy one), `both-wrong` or `pytorch-rejected`. `ci/summarize_findings.py` lists the distinct
+findings with their verdicts in the job summary, grouping panics by message; the programs are in the
+`findings-*` artifacts. The fuzzer stops when most programs fail, which points to the environment.
+
+Findings are leads, not confirmed bugs, so no workflow opens issues. Open one by hand only once a
+bug reproduces in a standalone program on upstream `main`, an independent reference such as
+PyTorch shows Burn is wrong, and no existing issue covers it.
 
 Confirmed bugs become tests in `tests/known_bugs.rs`, which CI runs in a step allowed to fail; a
 test that starts passing marks the fix. `LAB_SKIP` skips tests by name fragment for known

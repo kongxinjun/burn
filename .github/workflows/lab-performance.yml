@@ -106,9 +106,6 @@ jobs:
     needs: models
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
-    permissions:
-      contents: read
-      issues: write
     strategy:
       fail-fast: false
       matrix:
@@ -173,17 +170,13 @@ jobs:
             --report report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: File an issue for regressions
-        if: steps.compare.outputs.regressed == 'true' && github.ref == 'refs/heads/lab'
+      # A regression on shared runners is a lead to measure again, not a confirmed bug: the report
+      # stays in the job summary and no issue is opened.
+      - name: Flag regressions
+        if: steps.compare.outputs.regressed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           NAME: ${{ matrix.name }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          gh label create lab-perf --color FBCA04 --description "Found by lab-performance" --force
-          { cat report.md; echo; echo "Run: $RUN_URL"; } > body.md
-          gh issue create --label lab-perf --title "lab-perf: $NAME slower on $(date -u +%F)" --body-file body.md
+        run: echo "::warning title=lab-perf::$NAME is slower than the base commit; see the job summary"
 
   publish:
     # Keeps the history charts on GitHub Pages: https://<owner>.github.io/<repo>/dev/bench/
