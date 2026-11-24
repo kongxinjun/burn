@@ -314,6 +314,10 @@ Reports also include the measured cost of a kernel launch.
   tensors whose spatial dimensions have size one, such as the output of global pooling.
   ([#6556](https://github.com/tracel-ai/burn/pull/6556)) [@kongxinjun](https://github.com/kongxinjun)
 
+- Fix fused reductions over an axis other than the last returning wrong values when the
+  reduction's input is computed in the same fused graph and read again after it, as in a
+  hand-written normalization `(x - x.mean_dim(d)) / ...` or a `log_softmax` over channels.
+
 - Fix fusion failures when tensors are dropped on another thread, and report failed transaction
   reads as errors instead of panicking. ([#6086](https://github.com/tracel-ai/burn/pull/6086),
   [#5970](https://github.com/tracel-ai/burn/pull/5970),

@@ -305,6 +305,52 @@ fn test_reduce_broadcasted_channels_last_unit_axes() {
     actual.assert_approx_eq::<FloatElem>(&expected, Tolerance::default());
 }
 
+/// A normalization over an axis that is not the last: `c = x - mean(x)` is materialized by the
+/// read block of the second reduce and read again by its broadcast output. A reduce routine may run
+/// its read block more than once on a line, so `c` must not be written over `x`. The first call
+/// races the fused reduce against the fallback, so the later calls run the tuned winner.
+#[test]
+fn test_reduce_broadcasted_normalize_middle_axis() {
+    let device = Default::default();
+    let shape = [4, 3, 6, 5];
+    let values: Vec<f32> = (0..shape.iter().product::<usize>())
+        .map(|i| (i * 37 % 101) as f32 / 50.0 - 1.0)
+        .collect();
+
+    for dim in 0..3 {
+        let expected = TensorData::new(normalized(&values, shape, dim), shape);
+        for _ in 0..3 {
+            let x = TestTensor::<1>::from_floats(values.as_slice(), &device).reshape(shape);
+            // Forces previous tensors to be materialized.
+            device.sync().unwrap();
+
+            let c = x.clone() - x.mean_dim(dim);
+            let output = c.clone() / c.powi_scalar(2).mean_dim(dim).add_scalar(1e-5).sqrt();
+
+            output
+                .into_data()
+                .assert_approx_eq::<FloatElem>(&expected, Tolerance::default());
+        }
+    }
+}
+
+/// `(x - mean(x)) / sqrt(mean((x - mean(x))^2) + 1e-5)` along `dim` of a contiguous `shape`.
+fn normalized(values: &[f32], shape: [usize; 4], dim: usize) -> Vec<f32> {
+    let stride: usize = shape[dim + 1..].iter().product();
+    let len = shape[dim];
+    let line = |i: usize| {
+        let first = i - (i / stride % len) * stride;
+        (0..len).map(move |k| values[first + k * stride])
+    };
+    (0..values.len())
+        .map(|i| {
+            let mean = line(i).sum::<f32>() / len as f32;
+            let var = line(i).map(|v| (v - mean).powi(2)).sum::<f32>() / len as f32;
+            (values[i] - mean) / (var + 1e-5).sqrt()
+        })
+        .collect()
+}
+
 /// Elementwise ops around a reduction, so fusion builds a `Reduce` block.
 fn fused_reduce_graph(rows: usize) -> TestTensor<2> {
     let device = Default::default();

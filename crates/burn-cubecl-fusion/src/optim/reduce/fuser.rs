@@ -55,8 +55,10 @@ impl ReduceFuser {
         let props = client.properties();
         let max_bindings = props.hardware.max_bindings;
         let settings_read = FuseSettings {
-            // Inplace would work, but not when we have a concrete output to write too.
-            inplace: true,
+            // The reduce routine runs this block at every line it reads, and may read a line more
+            // than once: a read masked past a tile's edge still runs it. An output written over
+            // the block's input would then be read back as that input.
+            inplace: false,
             ref_layout: RefLayoutSetting::OnlyContiguous,
             choose_output_layout: false,
             broadcast: false,
