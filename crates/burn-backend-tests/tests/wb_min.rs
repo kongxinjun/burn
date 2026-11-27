@@ -279,3 +279,33 @@ fn min_fused_mm_f16_transposed_rhs() {
         }
     }
 }
+
+/// Rank 2 and batch 2 variants of `min_fused_mm_f16_transposed_rhs`.
+#[test]
+fn min_fused_mm_f16_transposed_rhs_ranks() {
+    let d = Device::default();
+    for &(m, k, n) in &[(128usize, 256usize, 64usize), (128, 64, 64), (256, 512, 128)] {
+        report(&format!("f16 rank2 [{m},{k}] @ [{n},{k}]^T"), || {
+            let l = rt2([m, k], 1, &d).cast(FloatDType::F16);
+            let r = rt2([n, k], 2, &d).cast(FloatDType::F16).transpose();
+            let want = l.clone().cast(FloatDType::F32).matmul(r.clone().cast(FloatDType::F32));
+            let e = maxdiff(l.matmul(r).cast(FloatDType::F32).into_data(), want.into_data());
+            if e > 0.5 { Err(format!("maxdiff {e}")) } else { Ok(()) }
+        });
+        report(&format!("f16 batch2 [2,{m},{k}] @ [2,{n},{k}]^T"), || {
+            let l = rt([2, m, k], 1, &d).cast(FloatDType::F16);
+            let r = rt([2, n, k], 2, &d).cast(FloatDType::F16).swap_dims(1, 2);
+            let want = l.clone().cast(FloatDType::F32).matmul(r.clone().cast(FloatDType::F32));
+            let e = maxdiff(l.matmul(r).cast(FloatDType::F32).into_data(), want.into_data());
+            if e > 0.5 { Err(format!("maxdiff {e}")) } else { Ok(()) }
+        });
+        report(&format!("f32 [1,{m},{k}] @ [1,{n},{k}]^T"), || {
+            let l = rt([1, m, k], 1, &d);
+            let r = rt([1, n, k], 2, &d).swap_dims(1, 2);
+            let want = l.clone().matmul(r.clone()).into_data();
+            let _ = want;
+            let _ = l.matmul(r).into_data();
+            Ok(())
+        });
+    }
+}
