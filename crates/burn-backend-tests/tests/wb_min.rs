@@ -309,3 +309,25 @@ fn min_fused_mm_f16_transposed_rhs_ranks() {
         });
     }
 }
+
+/// `is_nan` of an f16 value computed in the same kernel, and NaN through `max_pair`.
+#[test]
+fn min_f16_is_nan_after_math() {
+    let d = Device::default();
+    let v = [f32::NAN, 1.0, f32::INFINITY, -2.0];
+    let w = [0.5, f32::NAN, f32::INFINITY, 3.0];
+    let ints = |t: Tensor<1, burn_tensor::Bool>| t.int().into_data().iter::<i64>().collect::<Vec<_>>();
+    for (name, dt) in [("f16", FloatDType::F16), ("f32", FloatDType::F32)] {
+        let x = || Tensor::<1>::from_data(v, &d).cast(dt);
+        let y = || Tensor::<1>::from_data(w, &d).cast(dt);
+        let check = |what: &str, got: Vec<i64>, want: Vec<i64>| {
+            report(&format!("{name} {what}"), || if got == want { Ok(()) } else { Err(format!("got {got:?} want {want:?}")) })
+        };
+        check("x.is_nan()", ints(x().is_nan()), vec![1, 0, 0, 0]);
+        check("(x*2+1).is_nan()", ints(x().mul_scalar(2.0).add_scalar(1.0).is_nan()), vec![1, 0, 0, 0]);
+        check("x.exp().is_nan()", ints(x().exp().is_nan()), vec![1, 0, 0, 0]);
+        check("(x-y).is_nan()", ints((x() - y()).is_nan()), vec![1, 1, 1, 0]);
+        let m: Vec<f32> = x().mul_scalar(0.5).max_pair(y()).cast(FloatDType::F32).into_data().iter::<f32>().collect();
+        check("(x*0.5).max_pair(y) nan mask", m.iter().map(|v| v.is_nan() as i64).collect(), vec![1, 1, 0, 0]);
+    }
+}
