@@ -224,3 +224,34 @@ fn min_select_same_shape() {
         close(&y.into_data(), &[9.0, 10.0, 11.0, 12.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
     });
 }
+
+fn rt2(shape: [usize; 2], seed: u64, d: &Device) -> Tensor<2> {
+    let [a, b] = shape;
+    rt([1, a, b], seed, d).reshape(shape)
+}
+
+fn maxdiff(a: TensorData, b: TensorData) -> f32 {
+    a.iter::<f32>().zip(b.iter::<f32>()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+}
+
+/// `lhs @ q.transpose()` for a block-quantized `q`, against `lhs @ q.dequantize().transpose()`.
+#[test]
+fn min_qmatmul_transposed() {
+    use burn_tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
+    let d = Device::default();
+    for (vname, value) in [("q8s", QuantValue::Q8S), ("q4s", QuantValue::Q4S)] {
+        for &(n, k, block) in &[(32usize, 32usize, 32u8), (64, 64, 32), (16, 32, 32), (32, 64, 32), (32, 32, 16)] {
+            for m in [1usize, 3, 17] {
+                report(&format!("{vname} block{block} lhs[{m},{k}] @ q[{n},{k}]^T"), || {
+                    let scheme = QuantScheme::default().with_value(value).with_store(QuantStore::PackedU32(0)).per_block([block], ScaleDtype::F32);
+                    let q = rt2([n, k], 7, &d).quantize_dynamic(&scheme);
+                    let x = rt2([m, k], 8, &d);
+                    let want = x.clone().matmul(q.clone().dequantize().transpose()).into_data();
+                    let got = x.matmul(q.transpose()).into_data();
+                    let e = maxdiff(got, want);
+                    if e > 1e-3 { Err(format!("maxdiff {e}")) } else { Ok(()) }
+                });
+            }
+        }
+    }
+}
