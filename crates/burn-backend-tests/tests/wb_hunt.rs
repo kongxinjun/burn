@@ -703,9 +703,26 @@ struct Fuzz<'a> {
     synced: Vec<TensorData>,
     mask: Tensor<3, Bool>,
     log: Vec<String>,
+    /// Stable names of the pool entries, for the log.
+    names: Vec<usize>,
+    next_name: usize,
 }
 
 impl<'a> Fuzz<'a> {
+    /// `what` with every `p<i>` (a pool position) replaced by that entry's name `t<n>`.
+    fn named(&self, what: &str) -> String {
+        what.split(' ')
+            .map(|w| {
+                let digits: String = w.strip_prefix('p').unwrap_or("").chars().take_while(char::is_ascii_digit).collect();
+                match digits.parse::<usize>() {
+                    Ok(i) if i < self.names.len() => format!("t{}{}", self.names[i], &w[1 + digits.len()..]),
+                    _ => w.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn pick(&mut self) -> usize {
         self.rng.next_u32() as usize % self.pool.len()
     }
@@ -721,10 +738,14 @@ impl<'a> Fuzz<'a> {
         if t.shape().num_elements() > 16384 {
             return;
         }
-        self.log.push(format!("{what} -> {:?}", t.dims()));
+        let what = self.named(&what);
+        self.log.push(format!("t{} = {what} -> {:?}", self.next_name, t.dims()));
         self.pool.push(t);
+        self.names.push(self.next_name);
+        self.next_name += 1;
         if self.pool.len() > 8 {
             self.pool.remove(0);
+            self.names.remove(0);
         }
     }
 
@@ -753,7 +774,7 @@ impl<'a> Fuzz<'a> {
             1 => {
                 let c = self.rng.f() * 2.0;
                 let e = self.rng.f();
-                self.push(a.mul_scalar(c).add_scalar(e), format!("affine p{i}"));
+                self.push(a.mul_scalar(c).add_scalar(e), format!("affine p{i} *{c} +{e}"));
             }
             2 | 3 => {
                 if let Some(j) = self.partner_same(i) {
@@ -817,16 +838,16 @@ impl<'a> Fuzz<'a> {
             9 => {
                 let r = self.coin(3) as usize;
                 let n = dims[r];
-                let t = if let (Some(j), true) = (self.partner_same(i), self.coin(2) == 0) {
+                let (t, how) = if let (Some(j), true) = (self.partner_same(i), self.coin(2) == 0) {
                     let b = self.pool[j].clone();
-                    Tensor::cat(vec![a, b], r)
+                    (Tensor::cat(vec![a, b], r), format!("with p{j}"))
                 } else if n >= 2 {
                     let part = a.clone().narrow(r, 0, n / 2);
-                    Tensor::cat(vec![a, part], r)
+                    (Tensor::cat(vec![a, part], r), format!("with its narrow(0..{})", n / 2))
                 } else {
-                    Tensor::cat(vec![a.clone(), a.neg()], r)
+                    (Tensor::cat(vec![a.clone(), a.neg()], r), "with its neg".to_string())
                 };
-                self.push(t, format!("cat p{i} dim{r}"));
+                self.push(t, format!("cat p{i} dim{r} {how}"));
             }
             10 => {
                 let r = self.coin(3) as usize;
@@ -837,13 +858,15 @@ impl<'a> Fuzz<'a> {
                     2 => a.max_dim(r),
                     _ => a.min_dim(r),
                 };
-                let t = if self.coin(2) == 0 { t.expand(dims) } else { t };
-                self.push(t, format!("reduce{k} p{i} dim{r}"));
+                let e = self.coin(2) == 0;
+                let t = if e { t.expand(dims) } else { t };
+                self.push(t, format!("reduce{k} p{i} dim{r}{}", if e { " expanded" } else { "" }));
             }
             11 => {
                 let j = self.pick();
                 self.synced.push(self.pool[j].clone().into_data());
-                self.log.push(format!("sync p{j}"));
+                let w = self.named(&format!("sync p{j}"));
+                self.log.push(w);
             }
             12 => {
                 let r = self.coin(3) as usize;
@@ -851,18 +874,19 @@ impl<'a> Fuzz<'a> {
             }
             13 => {
                 let [x, y, z] = dims;
-                let t = if let (Some(j), true) = (self.partner_same(i), self.coin(2) == 0) {
+                let (t, how) = if let (Some(j), true) = (self.partner_same(i), self.coin(2) == 0) {
                     let b = self.pool[j].clone();
-                    a.swap_dims(1, 2).matmul(b).mul_scalar(1.0 / y as f32)
+                    (a.swap_dims(1, 2).matmul(b).mul_scalar(1.0 / y as f32), format!("p{i}^T @ p{j}"))
                 } else {
-                    a.clone().matmul(a.swap_dims(1, 2)).mul_scalar(1.0 / z as f32)
+                    (a.clone().matmul(a.swap_dims(1, 2)).mul_scalar(1.0 / z as f32), format!("p{i} @ p{i}^T"))
                 };
-                self.push(t, format!("matmul p{i}"));
+                self.push(t, format!("matmul {how}"));
             }
             14 => {
                 let r = self.coin(3) as usize;
-                let t = if self.coin(2) == 0 { act::softmax(a, r) } else { act::log_softmax(a, r).mul_scalar(0.25) };
-                self.push(t, format!("softmax p{i} dim{r}"));
+                let sm = self.coin(2) == 0;
+                let t = if sm { act::softmax(a, r) } else { act::log_softmax(a, r).mul_scalar(0.25) };
+                self.push(t, format!("{} p{i} dim{r}", if sm { "softmax" } else { "log_softmax*0.25" }));
             }
             15 => {
                 let r = self.coin(3) as usize;
@@ -871,12 +895,13 @@ impl<'a> Fuzz<'a> {
             16 => {
                 if dims == self.mask.dims() {
                     let m = self.mask.clone();
-                    let t = if self.coin(2) == 0 {
+                    let mw = self.coin(2) == 0;
+                    let t = if mw {
                         a.clone().mask_where(m, a.mul_scalar(-0.5))
                     } else {
                         a.mask_fill(m, 0.25)
                     };
-                    self.push(t, format!("mask p{i}"));
+                    self.push(t, format!("{} p{i}", if mw { "mask_where(-0.5x)" } else { "mask_fill(0.25)" }));
                 }
             }
             17 => {
@@ -889,8 +914,9 @@ impl<'a> Fuzz<'a> {
                 let r = self.coin(3) as usize;
                 let n = dims[r];
                 let idx: Vec<i64> = (0..n.max(1)).map(|_| (self.rng.next_u32() as usize % n.max(1)) as i64).collect();
+                let what = format!("select p{i} dim{r} {idx:?}");
                 let idx = Tensor::<1, Int>::from_data(TensorData::new(idx, [n.max(1)]), self.d);
-                self.push(a.select(r, idx), format!("select p{i} dim{r}"));
+                self.push(a.select(r, idx), what);
             }
             _ => {
                 let r = self.coin(3) as usize;
@@ -945,7 +971,7 @@ fn fuzz_run(seed: u64, steps: usize, shape: [usize; 3], vseed: u64, d: &Device, 
         inputs.push(t);
     }
     let mask = make(&randv(&shape, vseed * 7 + 5), shape, Layout::Contig, &d).greater_elem(0.0);
-    let mut fz = Fuzz { rng: Rng::new(seed), d: &d, pool: inputs.clone(), inputs: inputs.clone(), synced: vec![], mask, log: vec![] };
+    let mut fz = Fuzz { rng: Rng::new(seed), d: &d, pool: inputs.clone(), inputs: inputs.clone(), synced: vec![], mask, log: vec![], names: vec![0, 1, 2], next_name: 3 };
     for _ in 0..steps {
         fz.step();
     }
@@ -1386,5 +1412,28 @@ fn hunt_transaction() {
             });
         }
     }
+    p.finish();
+}
+
+// ---------------------------------------------------------------- replay
+
+/// Replays one random program: `WB_SEED`, `WB_STEPS`, `WB_SHAPE=a,b,c`, `WB_GRAD=1`; prints its
+/// log and whether the device run panics or differs from Flex.
+#[test]
+fn hunt_replay() {
+    let Ok(seed) = std::env::var("WB_SEED") else { return };
+    let seed: u64 = seed.parse().unwrap();
+    let steps: usize = std::env::var("WB_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(8 + (seed % 17) as usize);
+    let shape: [usize; 3] = std::env::var("WB_SHAPE")
+        .ok()
+        .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect::<Vec<usize>>().try_into().unwrap())
+        .unwrap_or_else(|| fuzz_shape(seed));
+    let grad = std::env::var("WB_GRAD").is_ok_and(|v| v == "1");
+    let mut p = Probe::new("replay");
+    let (_, log) = fuzz_run(seed, steps, shape, 1, &refd(), grad);
+    for (i, l) in log.iter().enumerate() {
+        println!("step\t{i}\t{l}");
+    }
+    p.case(format!("seed{seed} steps{steps} {shape:?}"), LOOSE, |d| fuzz_run(seed, steps, shape, 1, d, grad).0);
     p.finish();
 }
