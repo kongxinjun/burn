@@ -323,6 +323,11 @@ impl Probe {
                 res
             }
         };
+        if res.as_ref().is_err_and(|m| m.starts_with("device panicked")) && device_poisoned() {
+            println!("FAIL\t{}\t{name}\t{}", self.group, res.unwrap_err());
+            println!("POISONED\t{}\t{name}\tthe device fails a trivial op after this case; stopping", self.group);
+            std::process::exit(3);
+        }
         match res {
             Ok(()) => if verbose() { println!("ok\t{}\t{name}", self.group) },
             Err(m) => {
@@ -377,6 +382,11 @@ macro_rules! out {
 const SHAPE: [usize; 4] = [2, 3, 5, 7];
 
 // ---------------------------------------------------------------- reductions
+/// Whether the device under test fails even a trivial op (a failed launch poisons it).
+fn device_poisoned() -> bool {
+    catch_unwind(AssertUnwindSafe(|| Tensor::<1>::ones([4], &dut()).sum().into_data())).is_err()
+}
+
 fn verbose() -> bool {
     std::env::var("WB_VERBOSE").is_ok_and(|v| v == "1")
 }
@@ -1166,7 +1176,6 @@ fn hunt_flex32() {
     k!("topk", LOOSE, |d| x(d).topk(3, 3));
     k!("softmax", LOOSE, |d| act::softmax(x(d), 3));
     k!("log_softmax", LOOSE, |d| act::log_softmax(x(d), 2));
-    k!("matmul", LOOSE, |d| x(d).matmul(y(d).swap_dims(2, 3)));
     k!("cat", LOOSE, |d| Tensor::cat(vec![x(d), y(d)], 1));
     k!("cat fused", LOOSE, |d| Tensor::cat(vec![x(d), y(d)], 3).mul_scalar(2.0));
     k!("mask_where", LOOSE, |d| x(d).mask_where(y(d).greater_elem(0.0), y(d)));
@@ -1189,10 +1198,6 @@ fn hunt_flex32() {
     k!("interpolate", LOOSE, |d| module::interpolate(x(d), InterpolateOptions::new(InterpolateMode::Bilinear { coordinate_transform: CoordinateTransformMode::HalfPixel }).with_output_size([10, 14])));
     k!("avg_pool2d", LOOSE, |d| module::avg_pool2d(x(d), AvgPoolOptions::new([2, 2])));
     k!("max_pool2d", LOOSE, |d| module::max_pool2d(x(d), MaxPoolOptions::new([2, 2])));
-    k!("conv2d", LOOSE, |d| {
-        let wt = Tensor::<4>::from_data(TensorData::new(randv(&[4, 3, 3, 3], 5), [4, 3, 3, 3]), d).cast(dt_of(d));
-        module::conv2d(x(d), wt, None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1))
-    });
     if dut().supports_dtype(DType::F16) {
         k!("cast f16 roundtrip", HALF, |d| x(d).cast(FloatDType::F16).cast(dt_of(d)));
     }
@@ -1205,6 +1210,34 @@ fn hunt_flex32() {
     k!("sign", EXACT, |d| x(d).sign());
     k!("atan2", LOOSE, |d| x(d).atan2(y(d)));
     k!("fmod", LOOSE, |d| x(d).fmod_scalar(0.3));
+    p.finish();
+}
+
+/// Flex32 matmul and conv, apart: a failed launch poisons the device for every later case.
+#[test]
+fn hunt_flex32_matmul() {
+    let mut p = Probe::new("flex32_matmul");
+    if !dut().supports_dtype(DType::Flex32) {
+        return;
+    }
+    let v = distinctv(&SHAPE, 21);
+    let w = randv(&SHAPE, 22);
+    let dt_of = |d: &Device| if is_ref(d) { FloatDType::F32 } else { FloatDType::Flex32 };
+    let x = |d: &Device| make(&v, SHAPE, Layout::Contig, d).cast(dt_of(d));
+    let y = |d: &Device| make(&w, SHAPE, Layout::PermLast, d).cast(dt_of(d));
+    macro_rules! k {
+        ($name:expr, $tol:expr, $f:expr) => {
+            p.case(format!("{}", $name), $tol, |d| {
+                let t: Tensor<4> = $f(d);
+                kept(t, DType::from(dt_of(d)))
+            });
+        };
+    }
+    k!("matmul", LOOSE, |d| x(d).matmul(y(d).swap_dims(2, 3)));
+    k!("conv2d", LOOSE, |d| {
+        let wt = Tensor::<4>::from_data(TensorData::new(randv(&[4, 3, 3, 3], 5), [4, 3, 3, 3]), d).cast(dt_of(d));
+        module::conv2d(x(d), wt, None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1))
+    });
     p.finish();
 }
 
@@ -1315,6 +1348,42 @@ fn hunt_fused_matmul() {
                 p.case(format!("prologue tanh mm {tag}"), tol, |d| out![l(d).tanh().matmul(r(d).mul_scalar(2.0)).add_scalar(1.0).cast(FloatDType::F32)]);
                 p.case(format!("mm swap out {tag}"), tol, |d| out![l(d).matmul(r(d)).swap_dims(1, 2).tanh().cast(FloatDType::F32)]);
             }
+        }
+    }
+    p.finish();
+}
+
+// ---------------------------------------------------------------- transactions
+
+/// Reads several pending (unfused, fused, int, bool, quantized, aliased) tensors in one
+/// transaction, as a metric or a logger does.
+#[test]
+fn hunt_transaction() {
+    use burn_tensor::Transaction;
+    let mut p = Probe::new("transaction");
+    for seed in 0..scale(12) as u64 {
+        let shape = fuzz_shape(seed + 40_000);
+        let v = randv(&shape, seed);
+        for layout in [Layout::Contig, Layout::PermRev, Layout::Window] {
+            p.case(format!("seed{seed} {shape:?} {layout:?}"), LOOSE, |d| {
+                let x = make(&v, shape, layout, d);
+                let y = x.clone().exp().mul_scalar(0.5);
+                let z = Tensor::cat(vec![y.clone(), x.clone().tanh()], 1);
+                let i = x.clone().argmax(2);
+                let b = x.clone().greater_elem(0.0).int();
+                let s = y.clone().sum();
+                let first = Transaction::default()
+                    .register(y.clone())
+                    .register(z.clone())
+                    .register(i)
+                    .register(b)
+                    .register(s)
+                    .register(y.clone())
+                    .execute();
+                // Keep using the tensors after the read, then read again.
+                let after = Transaction::default().register(y.add(z.narrow(1, 0, shape[1]))).register(x).execute();
+                first.into_iter().chain(after).collect()
+            });
         }
     }
     p.finish();
