@@ -1,0 +1,32 @@
+diff --git a/crates/burn-cubecl-fusion/src/engine/trace/fuser.rs b/crates/burn-cubecl-fusion/src/engine/trace/fuser.rs
+index 0f960d971..8fa8cbcb8 100644
+--- a/crates/burn-cubecl-fusion/src/engine/trace/fuser.rs
++++ b/crates/burn-cubecl-fusion/src/engine/trace/fuser.rs
+@@ -102,6 +102,12 @@ impl TraceFuser {
+             .count()
+     }
+ 
++    /// Whether `tensor` is read through computed coordinates (`select`, `gather`, `cat`), which
++    /// a following block cannot take as a block-local value.
++    pub fn is_indexed(&self, tensor: &TensorIr) -> bool {
++        self.resources.indexed.contains_key(&tensor.id)
++    }
++
+     /// Tag the [tensor](TensorIr) as received from a previous block.
+     ///
+     /// This will avoid reading the input again and instead use le local version when possible.
+diff --git a/crates/burn-cubecl-fusion/src/optim/reduce/fuser.rs b/crates/burn-cubecl-fusion/src/optim/reduce/fuser.rs
+index 6ec61c155..6888e0950 100644
+--- a/crates/burn-cubecl-fusion/src/optim/reduce/fuser.rs
++++ b/crates/burn-cubecl-fusion/src/optim/reduce/fuser.rs
+@@ -110,7 +110,9 @@ impl ReduceFuser {
+         //     self.fuser.current_output_shape = op.input.shape.dims.clone();
+         // } else if self.fuser.current_output_shape != op.input.shape.dims {
+ 
+-        if self.fuser.current_output_shape != op.input.shape {
++        if self.fuser.current_output_shape != op.input.shape
++            || self.fuser.fuser.fuser.is_indexed(&op.input)
++        {
+             self.fuser.close();
+             self.fuser_read_fallback.close();
+             return;
