@@ -213,6 +213,12 @@ fn min_select_same_shape() {
             "expsum" => x.exp().sum_dim(1),
             "max" => x.max_dim(1),
             "sub_max" => x.clone() - x.max_dim(1),
+            "gather" => {
+                let i = Tensor::<2, burn_tensor::Int>::from_data([[3, 2, 1, 0], [0, 1, 2, 3], [1, 1, 1, 1]], &d);
+                let g = x.clone().gather(1, i);
+                let _ = x.sum_dim(1);
+                return close(&g.into_data(), &[4.0, 3.0, 2.0, 1.0, 5.0, 6.0, 7.0, 8.0, 10.0, 10.0, 10.0, 10.0]);
+            }
             _ => x.exp(),
         };
         close(&y.into_data(), &[9.0, 10.0, 11.0, 12.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
