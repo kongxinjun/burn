@@ -387,6 +387,12 @@ fn device_poisoned() -> bool {
     catch_unwind(AssertUnwindSafe(|| Tensor::<1>::ones([4], &dut()).sum().into_data())).is_err()
 }
 
+/// Steer clear of bugs already found (`WB_AVOID_KNOWN=0` turns this off), so one known crash
+/// does not poison the device for every later case.
+fn avoid_known() -> bool {
+    std::env::var("WB_AVOID_KNOWN").map_or(true, |v| v != "0")
+}
+
 fn verbose() -> bool {
     std::env::var("WB_VERBOSE").is_ok_and(|v| v == "1")
 }
@@ -913,9 +919,12 @@ impl<'a> Fuzz<'a> {
             18 => {
                 let r = self.coin(3) as usize;
                 let n = dims[r];
-                let idx: Vec<i64> = (0..n.max(1)).map(|_| (self.rng.next_u32() as usize % n.max(1)) as i64).collect();
+                // One index more than the axis: a select keeping its input's shape beside a
+                // reduce of that input panics under fusion (wb_min::min_select_same_shape).
+                let len = if avoid_known() { n.max(1) + 1 } else { n.max(1) };
+                let idx: Vec<i64> = (0..len).map(|_| (self.rng.next_u32() as usize % n.max(1)) as i64).collect();
                 let what = format!("select p{i} dim{r} {idx:?}");
-                let idx = Tensor::<1, Int>::from_data(TensorData::new(idx, [n.max(1)]), self.d);
+                let idx = Tensor::<1, Int>::from_data(TensorData::new(idx, [len]), self.d);
                 self.push(a.select(r, idx), what);
             }
             _ => {
