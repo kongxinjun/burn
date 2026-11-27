@@ -314,6 +314,7 @@ fn min_fused_mm_f16_transposed_rhs_ranks() {
 #[test]
 fn min_f16_is_nan_after_math() {
     let d = Device::default();
+
     let v = [f32::NAN, 1.0, f32::INFINITY, -2.0];
     let w = [0.5, f32::NAN, f32::INFINITY, 3.0];
     let ints = |t: Tensor<1, burn_tensor::Bool>| t.int().into_data().iter::<i64>().collect::<Vec<_>>();
@@ -330,4 +331,7 @@ fn min_f16_is_nan_after_math() {
         let m: Vec<f32> = x().mul_scalar(0.5).max_pair(y()).cast(FloatDType::F32).into_data().iter::<f32>().collect();
         check("(x*0.5).max_pair(y) nan mask", m.iter().map(|v| v.is_nan() as i64).collect(), vec![1, 1, 0, 0]);
     }
+    let caps = format!("{:?}", d.capabilities().map(|c| c.properties));
+    let name = caps.find("name").map(|i| &caps[i..(i + 120).min(caps.len())]).unwrap_or("?");
+    println!("device {d:?} identity {name}");
 }
