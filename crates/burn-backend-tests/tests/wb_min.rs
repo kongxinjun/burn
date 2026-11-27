@@ -255,3 +255,27 @@ fn min_qmatmul_transposed() {
         }
     }
 }
+
+/// f16 matmul with a column-major rhs and an element-wise epilogue (fused under fusion).
+#[test]
+fn min_fused_mm_f16_transposed_rhs() {
+    let d = Device::default();
+    for &(m, k, n) in &[(128usize, 256usize, 64usize), (64, 64, 64), (128, 64, 64)] {
+        for epilogue in [false, true] {
+            report(&format!("f16 [1,{m},{k}] @ [1,{n},{k}]^T epilogue={epilogue}"), || {
+                let l = rt([1, m, k], 1, &d).cast(FloatDType::F16);
+                let r = rt([1, n, k], 2, &d).cast(FloatDType::F16).swap_dims(1, 2);
+                let b = rt([1, 1, n], 3, &d).cast(FloatDType::F16);
+                let want = l.clone().cast(FloatDType::F32).matmul(r.clone().cast(FloatDType::F32));
+                let got = l.matmul(r);
+                let (got, want) = if epilogue {
+                    (burn_tensor::activation::gelu(got + b.clone()), burn_tensor::activation::gelu(want + b.cast(FloatDType::F32)))
+                } else {
+                    (got, want)
+                };
+                let e = maxdiff(got.cast(FloatDType::F32).into_data(), want.into_data());
+                if e > 0.5 { Err(format!("maxdiff {e}")) } else { Ok(()) }
+            });
+        }
+    }
+}
