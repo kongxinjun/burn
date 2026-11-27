@@ -381,6 +381,11 @@ fn verbose() -> bool {
     std::env::var("WB_VERBOSE").is_ok_and(|v| v == "1")
 }
 
+/// The half dtypes the device under test supports (a failed kernel poisons a wgpu device).
+fn half_dtypes() -> Vec<FloatDType> {
+    [FloatDType::F16, FloatDType::BF16].into_iter().filter(|&t| dut().supports_dtype(DType::from(t))).collect()
+}
+
 fn is_ref(d: &Device) -> bool {
     d.as_dispatch() == refd().as_dispatch()
 }
@@ -545,7 +550,7 @@ fn cat_family<const D: usize>(p: &mut Probe, bases: &[([usize; D], usize)]) {
             // Other dtypes, a few shapes of the same op.
             let mix = CAT_MIXES[1 + si % (CAT_MIXES.len() - 1)];
             let seed = 5000 + si as u64;
-            for dt in [FloatDType::F16, FloatDType::BF16] {
+            for dt in half_dtypes() {
                 p.case(format!("r{D} {base:?} dim{dim} sizes{sizes:?} {dt:?} affine"), HALF, |d| {
                     let xs: Vec<Tensor<D>> = cat_inputs(base, dim, sizes, mix, seed, d).into_iter().map(|x| x.cast(dt)).collect();
                     out![Tensor::cat(xs, dim).mul_scalar(2.0).add_scalar(1.0).cast(FloatDType::F32)]
@@ -618,7 +623,7 @@ fn hunt_nan() {
     let bv = nanv(&bshape, 14, 0.3);
     for (vi, v) in vs.iter().enumerate() {
         for layout in LAYOUTS {
-            for dt in [FloatDType::F32, FloatDType::F16, FloatDType::BF16] {
+            for dt in [FloatDType::F32].into_iter().chain(half_dtypes()) {
                 // On the reference a half input is rounded, then computed in f32.
                 let x = |d: &Device| {
                     let t = make(v, shape, layout, d).cast(dt);
@@ -1106,6 +1111,210 @@ fn hunt_quant() {
                 let l = Tensor::<3>::from_data(TensorData::new(randv(&[1, 5, k], 4), [1, 5, k]), d);
                 out![l.clone().matmul(q.clone()), l.matmul(q.dequantize())]
             });
+        }
+    }
+    p.finish();
+}
+
+// ---------------------------------------------------------------- Flex32 dtype preservation
+
+/// Values compared in f32, plus a flag: whether the op kept the input's float dtype.
+fn kept(t: Tensor<4>, dt: DType) -> Vec<TensorData> {
+    let same = (t.dtype() == dt) as i64;
+    vec![t.cast(FloatDType::F32).into_data(), TensorData::new(vec![same], [1])]
+}
+
+#[test]
+fn hunt_flex32() {
+    let mut p = Probe::new("flex32");
+    if !dut().supports_dtype(DType::Flex32) {
+        println!("SKIP\tflex32\tdevice does not support Flex32");
+        return;
+    }
+    let v = distinctv(&SHAPE, 21);
+    let w = randv(&SHAPE, 22);
+    let dt_of = |d: &Device| if is_ref(d) { FloatDType::F32 } else { FloatDType::Flex32 };
+    let x = |d: &Device| make(&v, SHAPE, Layout::Contig, d).cast(dt_of(d));
+    let y = |d: &Device| make(&w, SHAPE, Layout::PermLast, d).cast(dt_of(d));
+    macro_rules! k {
+        ($name:expr, $tol:expr, $f:expr) => {
+            p.case(format!("{}", $name), $tol, |d| {
+                let t: Tensor<4> = $f(d);
+                kept(t, DType::from(dt_of(d)))
+            });
+        };
+    }
+    k!("exp", LOOSE, |d| x(d).exp());
+    k!("log", LOOSE, |d| x(d).abs().add_scalar(0.5).log());
+    k!("tanh", LOOSE, |d| x(d).tanh());
+    k!("sigmoid", LOOSE, |d| act::sigmoid(x(d)));
+    k!("gelu", LOOSE, |d| act::gelu(x(d)));
+    k!("add", LOOSE, |d| x(d) + y(d));
+    k!("mul scalar", LOOSE, |d| x(d).mul_scalar(3.0));
+    k!("powf", LOOSE, |d| x(d).abs().powf(y(d).abs()));
+    k!("max_pair", LOOSE, |d| x(d).max_pair(y(d)));
+    k!("sum_dim", LOOSE, |d| x(d).sum_dim(2));
+    k!("mean_dim", LOOSE, |d| x(d).mean_dim(3));
+    k!("max_dim", LOOSE, |d| x(d).max_dim(1));
+    k!("nan_max_dim", LOOSE, |d| x(d).nan_max_dim(1));
+    k!("prod_dim", LOOSE, |d| x(d).add_scalar(1.5).prod_dim(3));
+    k!("cumsum", LOOSE, |d| x(d).cumsum(3));
+    k!("cumprod", LOOSE, |d| x(d).add_scalar(1.5).cumprod(2));
+    k!("cummax", LOOSE, |d| x(d).cummax(3));
+    k!("sort", LOOSE, |d| x(d).sort(3));
+    k!("sort_desc", LOOSE, |d| x(d).sort_descending(2));
+    k!("topk", LOOSE, |d| x(d).topk(3, 3));
+    k!("softmax", LOOSE, |d| act::softmax(x(d), 3));
+    k!("log_softmax", LOOSE, |d| act::log_softmax(x(d), 2));
+    k!("matmul", LOOSE, |d| x(d).matmul(y(d).swap_dims(2, 3)));
+    k!("cat", LOOSE, |d| Tensor::cat(vec![x(d), y(d)], 1));
+    k!("cat fused", LOOSE, |d| Tensor::cat(vec![x(d), y(d)], 3).mul_scalar(2.0));
+    k!("mask_where", LOOSE, |d| x(d).mask_where(y(d).greater_elem(0.0), y(d)));
+    k!("mask_fill", LOOSE, |d| x(d).mask_fill(y(d).greater_elem(0.0), 2.0));
+    k!("gather", LOOSE, |d| {
+        let idx = x(d).argmax(3);
+        x(d).gather(3, idx)
+    });
+    k!("select", LOOSE, |d| x(d).select(2, Tensor::<1, Int>::from_data([4, 0, 2], d)));
+    k!("scatter add", LOOSE, |d| {
+        let idx = Tensor::<4, Int>::zeros([2, 3, 5, 7], d);
+        x(d).scatter(3, idx, y(d), IndexingUpdateOp::Add)
+    });
+    k!("slice_assign", LOOSE, |d| x(d).slice_assign(s![.., 1..2, .., 0..3], y(d).slice(s![.., 0..1, .., 0..3])));
+    k!("repeat", LOOSE, |d| x(d).repeat_dim(1, 2));
+    k!("flip", LOOSE, |d| x(d).flip([1, 3]));
+    k!("clamp", LOOSE, |d| x(d).clamp(-0.3, 0.4));
+    k!("expand", LOOSE, |d| x(d).sum_dim(0).expand([2, 3, 5, 7]));
+    k!("pad", LOOSE, |d| x(d).pad([(1, 1), (0, 2)], PadMode::Constant(0.5)));
+    k!("interpolate", LOOSE, |d| module::interpolate(x(d), InterpolateOptions::new(InterpolateMode::Bilinear { coordinate_transform: CoordinateTransformMode::HalfPixel }).with_output_size([10, 14])));
+    k!("avg_pool2d", LOOSE, |d| module::avg_pool2d(x(d), AvgPoolOptions::new([2, 2])));
+    k!("max_pool2d", LOOSE, |d| module::max_pool2d(x(d), MaxPoolOptions::new([2, 2])));
+    k!("conv2d", LOOSE, |d| {
+        let wt = Tensor::<4>::from_data(TensorData::new(randv(&[4, 3, 3, 3], 5), [4, 3, 3, 3]), d).cast(dt_of(d));
+        module::conv2d(x(d), wt, None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1))
+    });
+    if dut().supports_dtype(DType::F16) {
+        k!("cast f16 roundtrip", HALF, |d| x(d).cast(FloatDType::F16).cast(dt_of(d)));
+    }
+    k!("from int", LOOSE, |d| x(d).mul_scalar(10.0).int().float().cast(dt_of(d)).add(x(d)));
+    k!("random-like zeros_like", EXACT, |d| x(d).zeros_like());
+    k!("ones_like", EXACT, |d| x(d).ones_like());
+    k!("recip", LOOSE, |d| x(d).abs().add_scalar(0.5).recip());
+    k!("erf", LOOSE, |d| x(d).erf());
+    k!("round", EXACT, |d| x(d).mul_scalar(10.0).round());
+    k!("sign", EXACT, |d| x(d).sign());
+    k!("atan2", LOOSE, |d| x(d).atan2(y(d)));
+    k!("fmod", LOOSE, |d| x(d).fmod_scalar(0.3));
+    p.finish();
+}
+
+// ---------------------------------------------------------------- threads
+
+/// The same random programs on several threads at once, each on its own clone of the device.
+#[test]
+fn hunt_threads() {
+    let mut p = Probe::new("threads");
+    let seeds: Vec<u64> = (30_000..30_000 + scale(24) as u64).collect();
+    let expected: Vec<Vec<TensorData>> = seeds.iter().map(|&s| fuzz_run(s, 14, fuzz_shape(s), 1, &refd(), false).0).collect();
+    for round in 0..3 {
+        let results: Vec<Result<Vec<TensorData>, String>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = seeds
+                .iter()
+                .map(|&s| {
+                    sc.spawn(move || {
+                        catch_unwind(AssertUnwindSafe(|| fuzz_run(s, 14, fuzz_shape(s), 1, &dut(), false).0)).map_err(panic_msg)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for ((s, got), want) in seeds.iter().zip(results).zip(&expected) {
+            p.total += 1;
+            let res = got.and_then(|g| {
+                for (k, (a, b)) in g.iter().zip(want).enumerate() {
+                    compare(a, b, LOOSE).map_err(|m| format!("output {k}: {m}"))?;
+                }
+                Ok(())
+            });
+            if let Err(m) = res {
+                println!("FAIL\tthreads\tround{round} seed{s}\t{m}");
+                p.fails.push(format!("round{round} seed{s}: {m}"));
+            }
+        }
+    }
+    p.finish();
+}
+
+// ---------------------------------------------------------------- gradients of new ops
+
+#[test]
+fn hunt_grad_ops() {
+    let mut p = Probe::new("grad_ops");
+    let v = nanv(&SHAPE, 31, 0.2);
+    let w = randv(&SHAPE, 32);
+    for layout in [Layout::Contig, Layout::PermLast, Layout::Transposed] {
+        macro_rules! g {
+            ($name:expr, $f:expr) => {
+                p.case(format!("{} {layout:?}", $name), LOOSE, |d| {
+                    let d = d.clone().autodiff();
+                    let x = make(&v, SHAPE, layout, &d).require_grad();
+                    let y = make(&w, SHAPE, Layout::Contig, &d).require_grad();
+                    let out: Tensor<4> = $f(x.clone(), y.clone());
+                    let gr = out.sum().backward();
+                    let gx = x.grad(&gr).map(|t| t.into_data()).unwrap_or_else(|| TensorData::new(vec![0f32; numel(&SHAPE)], SHAPE));
+                    let gy = y.grad(&gr).map(|t| t.into_data()).unwrap_or_else(|| TensorData::new(vec![0f32; numel(&SHAPE)], SHAPE));
+                    vec![gx, gy]
+                });
+            };
+        }
+        for dim in 0..4 {
+            g!(format!("nan_max_dim{dim}"), |x: Tensor<4>, y: Tensor<4>| x.nan_max_dim(dim).mul(y.sum_dim(dim)).expand(SHAPE));
+            g!(format!("nan_min_dim{dim}"), |x: Tensor<4>, y: Tensor<4>| x.nan_min_dim(dim).mul(y.sum_dim(dim)).expand(SHAPE));
+            g!(format!("cat{dim}"), |x: Tensor<4>, y: Tensor<4>| {
+                let x = x.clone().mask_fill(x.is_nan(), 0.0);
+                Tensor::cat(vec![x.clone().tanh(), y.clone().mul_scalar(2.0), x], dim).exp().narrow(dim, 1, 2)
+                    .sum_dim(dim).expand(SHAPE)
+            });
+        }
+        g!("max_pair", |x: Tensor<4>, y: Tensor<4>| x.max_pair(y.clone()).mask_fill(y.is_nan(), 0.0));
+        g!("min_pair nan-masked", |x: Tensor<4>, y: Tensor<4>| {
+            let x = x.clone().mask_fill(x.is_nan(), 0.25);
+            x.min_pair(y).exp()
+        });
+        g!("nan_max all", |x: Tensor<4>, y: Tensor<4>| x.nan_max().reshape([1, 1, 1, 1]).mul(y).expand(SHAPE));
+    }
+    p.finish();
+}
+
+// ---------------------------------------------------------------- fused matmul epilogues
+
+#[test]
+fn hunt_fused_matmul() {
+    let mut p = Probe::new("fused_matmul");
+    let shapes: &[(usize, usize, usize, usize)] = &[
+        (1, 1, 16, 16), (1, 7, 9, 5), (2, 16, 16, 16), (2, 17, 33, 15), (1, 64, 64, 64), (3, 65, 31, 63),
+        (1, 128, 256, 64), (4, 1, 64, 128), (2, 129, 7, 130), (1, 255, 128, 1), (8, 32, 32, 32),
+    ];
+    for &(b, m, k, n) in shapes {
+        let lv = randv(&[b, m, k], (b * m * k) as u64);
+        let rv = randv(&[b, k, n], (b * k * n + 1) as u64);
+        let bias = randv(&[1, 1, n], (n + 2) as u64);
+        for (ll, rl) in [(Layout::Contig, Layout::Contig), (Layout::Transposed, Layout::Contig), (Layout::Contig, Layout::Transposed), (Layout::PermRev, Layout::Strided)] {
+            for dt in [FloatDType::F32].into_iter().chain(half_dtypes().into_iter().take(1)) {
+                let tag = format!("b{b} m{m} k{k} n{n} {ll:?}/{rl:?} {dt:?}");
+                let tol = if dt == FloatDType::F32 { MM } else { Tol { atol: 5e-2, rtol: 3e-2 } };
+                let io = |t: Tensor<3>, d: &Device| if is_ref(d) { t.cast(FloatDType::F32) } else { t.cast(dt) };
+                let l = |d: &Device| io(make(&lv, [b, m, k], ll, d).cast(dt), d);
+                let r = |d: &Device| io(make(&rv, [b, k, n], rl, d).cast(dt), d);
+                let bi = |d: &Device| io(Tensor::<3>::from_data(TensorData::new(bias.clone(), [1, 1, n]), d).cast(dt), d);
+                p.case(format!("mm+bias+gelu {tag}"), tol, |d| out![act::gelu(l(d).matmul(r(d)) + bi(d)).cast(FloatDType::F32)]);
+                p.case(format!("mm*scalar+relu then sum {tag}"), Tol { atol: tol.atol * 8.0, rtol: tol.rtol }, |d| {
+                    let o = act::relu(l(d).matmul(r(d)).mul_scalar(0.5));
+                    out![o.clone().cast(FloatDType::F32), o.sum_dim(2).cast(FloatDType::F32)]
+                });
+                p.case(format!("prologue tanh mm {tag}"), tol, |d| out![l(d).tanh().matmul(r(d).mul_scalar(2.0)).add_scalar(1.0).cast(FloatDType::F32)]);
+                p.case(format!("mm swap out {tag}"), tol, |d| out![l(d).matmul(r(d)).swap_dims(1, 2).tanh().cast(FloatDType::F32)]);
+            }
         }
     }
     p.finish();
